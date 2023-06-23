@@ -1344,7 +1344,7 @@ ValidReplicaState ==
 \* INV: ValidControllerState
 \* For catching spec bugs, ensure controller state is legal.
 ValidControllerState ==
-    \* there is no broker such that itsa fenced status is
+    \* there is no broker such that its fenced status is
     \* inconsistent with its membership to the unfenced set.
     /\ ~\E b \in Brokers :
         \/ /\ con_broker_state[b].status = FENCED
@@ -1482,7 +1482,7 @@ AlterPartitionEpochEventuallyReachedOrZero ==
             \/ replica_pending_ap_epoch[b] = 0)
 
 \* LIVENESS: EventuallyMetadataConverges
-\* Evebtually, each broker converges on the same metadata as the controller.
+\* Eventually, each broker converges on the same metadata as the controller.
 EventuallyMetadataConverges ==
     []<>(\A b \in Brokers : 
             /\ replica_part_state[b].isr = con_part_state.isr

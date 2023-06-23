@@ -1041,7 +1041,7 @@ TruncateToSafePoint(b, log, hwm, part_state) ==
              epoch_start_offset |-> Nil] 
        ELSE [log |-> <<>>, hwm |-> 0, leo |-> 0, epoch_start_offset |-> Nil]
 
-NextRecords(records, index) ==
+NextRecords(index) ==
     SubSeq(con_metadata_log, index, Len(con_metadata_log))
 
 RemainLeader(b, new_part_state) ==
@@ -1343,7 +1343,9 @@ ReceiveAlterPartitionResponse ==
               /\ broker_state[b].status = RUNNING
               /\ replica_status[b] = Leader
               /\ PendingAlterPartitionResponse(b)
-              /\ m.partition_epoch > replica_part_state[b].partition_epoch
+              /\ IF m.error = Nil
+                 THEN m.partition_epoch > replica_part_state[b].partition_epoch
+                 ELSE m.partition_epoch = replica_part_state[b].partition_epoch
               \* state mutations
               /\ IF m.error = Nil \* only IneligibleReplica error is modeled at the moment
                  THEN CompletePartitionChange(b, m)
@@ -1516,8 +1518,8 @@ WriteRecordToLeader ==
               /\ replica_replica_state' = [replica_replica_state EXCEPT ![b][b].leo = 
                                             new_leo]
               /\ inv_acked' = inv_acked @@ (v :> Nil)
-              /\ UNCHANGED << con_vars, broker_vars, broker_pending_hb_res, replica_pending_ap_epoch,
-                              replica_part_state, replica_status, 
+              /\ UNCHANGED << con_vars, broker_vars, broker_pending_hb_res,
+                              replica_pending_ap_epoch, replica_part_state, replica_status, 
                               replica_fetch_state, messages, aux_vars, inv_hwm, inv_consumed >>
 
 (*-----------------------------------------------------------------------
@@ -1586,6 +1588,8 @@ BeginCleanShutdown ==
 \* INVARIANTS
 \* ===============================================================
 
+\* INV: TypeOK
+\* Basic type checking
 TypeOK ==
     /\ con_unfenced \in SUBSET Brokers
     /\ con_active  \in SUBSET Brokers
@@ -1595,9 +1599,12 @@ TypeOK ==
     /\ replica_part_state \in [Brokers -> ReplicaPartitionState]
     /\ replica_fetch_state \in [Brokers -> FetcherState]
     /\ replica_replica_state \in [Brokers -> [Brokers -> ReplicaState]]
+    /\ replica_pending_ap_epoch \in [Brokers -> Nat]
     /\ aux_ctrs \in StateSpaceLimitCtrs
     /\ replica_status \in [Brokers -> {Leader, Follower, Truncating, Nil}]
 
+\* INV: ValidBrokerState
+\* For catching spec bugs, ensure broker state is legal.
 ValidBrokerState ==
     \A b \in Brokers :
         \/ broker_state[b].status # RUNNING
@@ -1605,6 +1612,8 @@ ValidBrokerState ==
            /\ broker_state[b].registered = TRUE
            /\ broker_state[b].ready_to_unfence = TRUE
 
+\* INV: ValidReplicaState
+\* For catching spec bugs, ensure replica state is legal.
 ValidReplicaState ==           
     \A b \in Brokers :
         /\ IF replica_status[b] = Leader
@@ -1614,11 +1623,37 @@ ValidReplicaState ==
         /\ \A offset \in 1..replica_part_data[b].leo :
                 replica_part_data[b].log[offset].offset = offset
 
-ValidLeaderISR ==
+\* INV: ValidControllerState
+\* For catching spec bugs, ensure controller state is legal.              
+ValidControllerState ==
+    \* there is no broker such that its fenced status is
+    \* inconsistent with its membership to the unfenced set.
+    /\ ~\E b \in Brokers :
+        \/ /\ con_broker_state[b].status = FENCED
+           /\ b \in con_unfenced              
+        \/ /\ con_broker_state[b].status = UNFENCED
+           /\ b \notin con_unfenced
+    \* A fenced broker cannot be in an ISR of size > 1
+    /\ IF Cardinality(con_part_state.isr) > 1
+       THEN ~\E b \in Brokers :
+               /\ con_broker_state[b].status = FENCED
+               /\ b \in con_part_state.isr
+       ELSE TRUE
+    \* The ISR cannot be empty
+    /\ con_part_state.isr # {} 
+
+\* INV: ValidLeaderMaximalISR
+\* The maximal ISR is critical for safety. The invariant here is that
+\* the maximal ISR on the (non-stale) leader must be a superset of
+\* the controller ISR. Else we can lose data. 
+IsNonStaleLeader(b) ==
+    /\ replica_status[b] = Leader
+    /\ replica_part_state[b].leader_epoch = con_part_state.leader_epoch
+
+ValidLeaderMaximalISR ==
     \A b \in Brokers :
         \* if the leader is a non-stale leader
-        IF /\ replica_status[b] = Leader
-           /\ replica_part_state[b].leader_epoch = con_part_state.leader_epoch
+        IF IsNonStaleLeader(b)
         THEN 
               \* if it doesn't have a pending AP Req then: maximal ISR = ISR
               /\ IF ~PendingAlterPartitionResponse(b)
@@ -1628,16 +1663,10 @@ ValidLeaderISR ==
               /\ \A b1 \in con_part_state.isr :
                     b1 \in replica_part_state[b].maximal_isr
         ELSE TRUE
-              
-ValidControllerState ==
-    ~\E b \in Brokers :
-        \/ /\ con_broker_state[b].status = FENCED
-           /\ \/ b \in con_unfenced              
-              \/ b \in con_active
-        \/ /\ con_broker_state[b].status = UNFENCED
-           /\ \/ b \notin con_unfenced              
-              \/ b \notin con_active
 
+\* INV: LeaderHasCompleteCommittedLog
+\* The replica selected as leader by the controller must have
+\* the entire acknowledged log else this is data loss.
 LeaderHasCompleteCommittedLog ==
     \/ con_part_state.leader = NoLeader
     \/ /\ con_part_state.leader # NoLeader
@@ -1647,6 +1676,9 @@ LeaderHasCompleteCommittedLog ==
                /\ \E offset \in DOMAIN replica_part_data[con_part_state.leader].log :
                     replica_part_data[con_part_state.leader].log[offset].value = v
 
+\* INV: NoPartitionLogDivergence
+\* The partition log on the leader must be consistent with
+\* every follower (up to the HWM per replica).
 NoPartitionLogDivergence == 
     \A offset \in 1..Cardinality(Values) :
         ~\E b1, b2 \in Brokers :
@@ -1656,14 +1688,20 @@ NoPartitionLogDivergence ==
             /\ replica_part_data[b2].hwm >= offset
             /\ replica_part_data[b1].log[offset].value # replica_part_data[b2].log[offset].value
 
+\* INV: NoMetadataLogDivergence
+\* The metadata log on the controller must be consistent with
+\* every broker (up to the last offset per broker).
 NoMetadataLogDivergence == 
     \A offset \in 1..Len(con_metadata_log) :
         ~\E b \in Brokers :
             /\ Len(broker_metadata_log[b]) >= offset
             /\ broker_metadata_log[b][offset] # con_metadata_log[offset]
 
+\*INV: NoCommittedRecordLostGlobally
 \* LeaderHasCompleteCommittedLog prefered as it triggers earlier.
-NoCommittedRecordLostTotally ==
+\* Losing an acknowledged record on the leader ultimately
+\* results in global data loss for that record.
+NoCommittedRecordLostGlobally ==
     \A v \in DOMAIN inv_acked :
         \/ inv_acked[v] \in { Nil, FALSE }
         \/ /\ inv_acked[v] = TRUE
@@ -1671,21 +1709,12 @@ NoCommittedRecordLostTotally ==
                \E offset \in DOMAIN replica_part_data[b].log :
                    replica_part_data[b].log[offset].value = v
 
-IsrNeverShrinksToZero ==
-    con_part_state.isr # {}
-
-FencedBrokerCannotBeInNonMinimalIsr ==
-    IF Cardinality(con_part_state.isr) > 1
-    THEN ~\E b \in Brokers :
-            /\ con_broker_state[b].status = FENCED
-            /\ b \in con_part_state.isr
-    ELSE TRUE 
-
-\* Not actually an invariant as the HWM is not monotonic    
-HighWatermarkIsMonotonic ==
-    \A b \in Brokers :
-        replica_part_data[b].hwm >= inv_hwm[b]    
-
+\* INV: ConsumedRecordsMatchLeaderLog
+\* Ensures consistency between records read in the past
+\* and the current leader log. 
+\* Consumers can consume up to the HWM. If a consumer consumes
+\* a record at a given offset, then later the record at that
+\* same offset does not exist or has changed, this invariant is violated. 
 ConsumedRecordsMatchLeaderLog ==
     \A b \in Brokers :
         \/ broker_state[b] # Leader
@@ -1694,36 +1723,53 @@ ConsumedRecordsMatchLeaderLog ==
                 replica_part_data[b].log[offset] = inv_consumed[offset]
         
 
+\* Not actually an invariant as the HWM is not monotonic    
+HighWatermarkIsMonotonic ==
+    \A b \in Brokers :
+        replica_part_data[b].hwm >= inv_hwm[b]  
+
 TestInv ==
-    ~\E m \in DOMAIN messages :
-        m.type = FetchResponse
+    TRUE
         
 
 \* ========================================================
 \* LIVENESS
 \* ========================================================
 
+\* LIVENESS: EventuallyCleanlyShutsdown
+\* Eventually, a broker that has PENDING_CONTROLLED_SHUTDOWN status, 
+\* reaches OFFLINE_CLEAN.
 EventuallyCleanlyShutsdown ==
     \A b \in Brokers :
         broker_state[b].status = PENDING_CONTROLLED_SHUTDOWN ~>
             broker_state[b].status = OFFLINE_CLEAN 
 
+\* LIVENESS: EventuallyRuns
+\* Eventually, a broker that has STARTING status, reaches RUNNING.
 EventuallyRuns ==
     \A b \in Brokers :
         broker_state[b].status = STARTING ~>
             /\ broker_state[b].status = RUNNING
             /\ con_broker_state[b].status = UNFENCED
 
+\* LIVENESS: EventuallyUnfenced
+\* Eventually, a broker that is fenced becomes unfenced.
 EventuallyUnfenced ==
     \A b \in Brokers :
         con_broker_state[b].status = FENCED ~>
             con_broker_state[b].status = UNFENCED
 
-AlterPartitionEpochEventuallyReached ==
+\* LIVENESS: AlterPartitionEpochEventuallyReachedOrZero
+\* Eventually, a replica that has sent an AlterPartition request
+\* reaches the expected partition epoch, or the request is rejected.
+AlterPartitionEpochEventuallyReachedOrZero ==
     []<>(\A b \in Brokers :
         replica_pending_ap_epoch[b] > 0 ~> 
-            replica_pending_ap_epoch[b] = replica_part_state[b].partition_epoch)
-    
+            \/ replica_pending_ap_epoch[b] = replica_part_state[b].partition_epoch
+            \/ replica_pending_ap_epoch[b] = 0)
+
+\* LIVENESS: EventuallyMetadataConverges
+\* Eventually, each broker converges on the same metadata as the controller.    
 EventuallyMetadataConverges ==
     []<>(\A b \in Brokers : 
             /\ replica_part_state[b].isr = con_part_state.isr
@@ -1731,11 +1777,16 @@ EventuallyMetadataConverges ==
             /\ replica_part_state[b].leader_epoch = con_part_state.leader_epoch
             /\ replica_part_state[b].partition_epoch = con_part_state.partition_epoch)
 
+\* LIVENESS: EventuallyWriteIsAcceptedOrRejected
+\* A produce request will eventually be positively or negatively acknowledged
 EventuallyWriteIsAcceptedOrRejected ==
     \A v \in Values :
         v \in DOMAIN inv_acked ~> /\ v \in DOMAIN inv_acked
                                   /\ inv_acked[v] \in {FALSE, TRUE}
 
+\* LIVENESS: EventuallyAcknowledgedValueFullyReplicated
+\* A record that gets positively acknowledged eventually becomes
+\* fully replicated.
 EventuallyCommittedValueFullyReplicated ==
     \A v \in Values :
         <>[](/\ v \in DOMAIN inv_acked
