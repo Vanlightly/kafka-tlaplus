@@ -61,7 +61,7 @@ NOTES:
 
 Invariants:
 - No acknowledged data is lost.
-- No consumed data is lost.
+- No consumed data is lost and consumed data remains consistent with the leader log.
 - No divergence between the leader log and the history of consumed records.
 - No divergence between the leader log and follower logs up to the HWM.
 - No divergence between the controller metadata log and broker metadata logs.
@@ -70,7 +70,7 @@ Liveness checks (assuming any failures are transitory):
 - STARTING brokers eventually reach RUNNING
 - FENCED brokers eventually become UNFENCED.
 - Eventually, all brokers converge on controller metadata state.
-- Eventually a write will be acknowledged (positively or negatively.
+- Eventually a write will be acknowledged (positively or negatively).
 - Eventually a positively acknowledged write will be fully replicated.
 
 Jump to the bottom of the spec for the Next state formula which lists all
@@ -116,10 +116,13 @@ CONSTANTS RegisterBrokerRequest,
 \* metadata log entry types
 CONSTANTS PartitionChangeRecord
 
+\* errors
+CONSTANTS IneligibleReplica, \* An AlterPartition error code.
+          FencedEpoch        \* An epoch of a request was stale
+
 \* other
 CONSTANTS Controller,        \* used to denote the destination or source of a message is the controller
           NoLeader,          \* a constant value to represent the partition has no leader
-          IneligibleReplica, \* An AlterPartition error code.
           Nil                \* a constant used to denote 'nothing' or 'not set'
 
 ASSUME InitIsrSize <= ReplicationFactor
@@ -148,19 +151,19 @@ VARIABLES replica_status,
           replica_part_data,       \* the actual partition log data on each replica.
           replica_fetch_state,     \* the state of the last pending fetch request
           replica_replica_state,   \* a map (used by the leader) to track the state of follower replicas
-          replica_pending_ap_epoch \* the partition epoch of an outstanding AlterPartition
-                                   \* request. Used to control when AP requests can be sent.
+          replica_pending_ap       \* info related to a pending AlterPartition request
 
 \* Message passing state
 VARIABLES messages  \* a collection used by the message passing logic.
 
 \* Auxilliary variables (not part of the protocol)           
-VARIABLES aux_ctrs   \* Some counters used to limit the number of times certain actions can occur, to limit the state space.
+VARIABLES aux_broker_epoch, \* Because we omit some metadata records, broker epochs cannot be based on metadata offsets.
+          aux_ctrs          \* Some counters used to limit the number of times certain actions can occur, to limit the state space.
 
 \* Auxilliary variables for verifying invariants (not part of the protocol)
 VARIABLES inv_acked,     \* Tracks whether a producer message has been acknowledged or not.
                          \* This is required to detect data loss.
-          inv_hwm,       \* Tracks the max HWM on each broker.
+          inv_true_hwm,  \* Tracks the true HWM
           inv_consumed   \* Tracks the records consumed to detect divergence.
 
 \* Variable lists
@@ -169,9 +172,9 @@ con_vars == << con_metadata_log,  con_broker_vars, con_part_state >>
 broker_vars == << broker_state, broker_metadata_log >>
 replica_vars == << replica_status, replica_part_state, replica_part_data,
                    replica_replica_state, replica_fetch_state,
-                   replica_pending_ap_epoch >>
-inv_vars == << inv_acked, inv_hwm, inv_consumed >>
-aux_vars == << aux_ctrs >>    
+                   replica_pending_ap >>
+inv_vars == << inv_acked, inv_true_hwm, inv_consumed >>
+aux_vars == << aux_broker_epoch, aux_ctrs >>    
 vars == << con_vars, broker_vars, replica_vars, messages, inv_vars, aux_vars >>
 view == << con_vars, broker_vars, replica_vars, messages, inv_vars >>
 
@@ -238,10 +241,6 @@ StateSpaceLimitCtrs ==
      fence_stale_ctr: Nat,
      alter_part_ctr: Nat] 
 
-AuxState ==
-    [\* The partition epoch the replica is expecting an AlterPartition response for
-     pending_ap_epoch: Nat]
-
 \* ======================================================================
 \* ------------ Messages type definitions -------------------------------
 
@@ -262,7 +261,7 @@ RegisterBrokerResponseType ==
 AlterPartitionRequestType ==
     [type: {AlterPartitionRequest},
      isr: SUBSET Brokers,
-     isr_and_epochs: SUBSET Brokers :> Nat,
+     isr_and_epochs: [SUBSET Brokers -> Nat],
      leader: Brokers,
      leader_epoch: Nat,
      partition_epoch: Nat,
@@ -270,13 +269,21 @@ AlterPartitionRequestType ==
      source: Brokers,
      dest: {Controller}]
      
-AlterPartitionResponseType ==
+AlterPartitionResponseTypeSuccess ==
     [type: {AlterPartitionResponse},
-     error: {Nil, IneligibleReplica},   
+     error: {Nil},   
      isr: SUBSET Brokers,
      leader: Brokers,
      leader_epoch: Nat,
      partition_epoch: Nat,
+     request: {AlterPartitionRequestType},
+     dest: {Controller},
+     source: Brokers]     
+     
+AlterPartitionResponseTypeFailure ==
+    [type: {AlterPartitionResponse},
+     error: {FencedEpoch, IneligibleReplica},   
+     request: {AlterPartitionRequestType},
      dest: {Controller},
      source: Brokers]     
 
@@ -359,6 +366,9 @@ __RemoteBrokerKnowsItIsLeader(l, leader_epoch) ==
     /\ replica_status[l] = Leader
     /\ replica_part_state[l].leader_epoch = leader_epoch
 
+__MetadataCaughtUp(b) ==
+    Len(broker_metadata_log[b]) = Len(con_metadata_log)
+
 \* ======================================================================
 \* ------------ Helpers -------------------------------------------------
 
@@ -411,30 +421,35 @@ MaybeAdvanceHighWatermark(b, old_hwm, new_hwm) ==
                                        replica_part_data[b].log[offset].value = v
                                  THEN TRUE
                                  ELSE inv_acked[v]]
-         \* record the highest HWM for this replica (for checking monotonicity)
-         /\ inv_hwm' = [inv_hwm EXCEPT ![b] = IF new_hwm > inv_hwm[b]
-                                              THEN new_hwm ELSE inv_hwm[b]]
-         \* record which records got consumed by consumers
-         /\ inv_consumed' = inv_consumed \o SubSeq(replica_part_data[b].log, old_hwm+1, new_hwm)
-    ELSE UNCHANGED << replica_part_data, inv_acked, inv_hwm, inv_consumed >>
+         \* update the true high watermark
+         /\ inv_true_hwm' = IF new_hwm > inv_true_hwm
+                            THEN new_hwm ELSE inv_true_hwm
+         \* If the "real" HWM has advanced, record which records
+         \* got consumed by consumers.
+         /\ inv_consumed' = IF new_hwm > inv_true_hwm
+                            THEN inv_consumed \o SubSeq(replica_part_data[b].log, inv_true_hwm+1, new_hwm)
+                            ELSE inv_consumed
+    ELSE UNCHANGED << replica_part_data, inv_acked, inv_true_hwm, inv_consumed >>
 
-\* If the ISR has shrunk below minISR, or the replica lost leadership
-\* then negatively acknowledge all uncommitted records.
-MaybeFailPendingWrites(b, part_state) ==
+FailPendingWrites(b) ==
     LET leo == replica_part_data[b].leo
         hwm == replica_part_data[b].hwm
         log == replica_part_data[b].log
     IN
-        IF hwm = leo
-        THEN UNCHANGED inv_acked
-        ELSE IF \/ Cardinality(part_state.maximal_isr) < MinISR
-                \/ b # part_state.leader
-             THEN inv_acked' = [v \in DOMAIN inv_acked
-                                        |-> IF /\ inv_acked[v] = Nil
-                                               /\ \E offset \in hwm+1..leo : log[offset].value = v
-                                            THEN FALSE \* neg ack
-                                            ELSE inv_acked[v]]
-             ELSE UNCHANGED inv_acked
+        inv_acked' = [v \in DOMAIN inv_acked
+                        |-> IF /\ inv_acked[v] = Nil
+                               /\ \E offset \in hwm+1..leo : log[offset].value = v
+                            THEN FALSE \* neg ack
+                            ELSE inv_acked[v]]
+
+\* If the ISR has shrunk below minISR, or the replica lost leadership
+\* then negatively acknowledge all uncommitted records.
+MaybeFailPendingWrites(b, part_state) ==
+    IF /\ replica_part_data[b].hwm < replica_part_data[b].leo
+       /\ \/ Cardinality(part_state.maximal_isr) < MinISR
+          \/ b # part_state.leader
+    THEN FailPendingWrites(b)
+    ELSE UNCHANGED inv_acked
 
 \* If the ISR has shrunk but is still >= MinISR, then we may
 \* need to advance the high watermark and ack records, else
@@ -446,16 +461,20 @@ MaybeUpdateHwmOnPartitionChange(b, part_state) ==
                                          replica_replica_state[b])
          IN MaybeAdvanceHighWatermark(b, old_hwm, new_hwm)
     ELSE /\ MaybeFailPendingWrites(b, part_state)
-         /\ UNCHANGED << replica_part_data, inv_hwm, inv_consumed >>
+         /\ UNCHANGED << replica_part_data, inv_true_hwm, inv_consumed >>
 
 \* Restart a fetcher by setting the fetch_offset to the LEO + 1
-\* in the case that this is a new leader epoch or there is no
-\* pending fetch response. Else keep the fetch offset unchanged
-\* as it means the replica was already a follower and has a valid
+\* in the case that this is:
+\*  - a new leader epoch.
+\*  - or there is no pending fetch response. 
+\*  - It was previously reset and has no state.
+\* Else keep the fetch offset unchanged as it means the
+\* replica was already a follower and has a valid
 \* outstanding fetch request.
 StartFetcher(b, leader_epoch, leo) ==
     IF \/ leader_epoch > replica_part_state[b].leader_epoch
        \/ replica_fetch_state[b].pending_response = FALSE
+       \/ replica_fetch_state[b].fetch_offset = 0
     THEN replica_fetch_state' = [replica_fetch_state EXCEPT ![b] = 
                                     [fetch_offset     |-> leo + 1,
                                      pending_response |-> FALSE]]
@@ -468,7 +487,9 @@ StopFetcher(b) ==
                                  pending_response |-> FALSE]]
 
 ResetPendingAlterPartition(b) ==
-    replica_pending_ap_epoch' = [replica_pending_ap_epoch EXCEPT ![b] = 0]
+    replica_pending_ap' = [replica_pending_ap EXCEPT ![b] = 
+                            [epoch   |-> 0,
+                             request |-> Nil]]
 
 NoPartitionChange ==
     UNCHANGED << con_part_state, con_metadata_log >>
@@ -536,7 +557,7 @@ BrokerStart ==
         /\ ResetPendingAlterPartition(b)
         /\ SendBrokerRegistration(b)
         /\ UNCHANGED << con_vars, broker_metadata_log, replica_part_state,
-                        replica_part_data, inv_vars >>        
+                        replica_part_data, inv_vars, aux_broker_epoch >>        
 
 (* ---------------------------------------------------------------
    ACTION: ReceiveBrokerRegRequest
@@ -549,7 +570,12 @@ BrokerStart ==
      the existing registration.
    
    The controller assigns the broker an epoch based on the last 
-   offset in the metadata log. The broker starts in the FENCED status.
+   offset in the metadata log.
+   
+   In this simplified spec, the full start-up sequence is omitted
+   which results in the following differences:
+    - The broker starts in the UNFENCED status.
+    - No BrokerRegistration record is added to the metadata log
 ------------------------------------------------------------------*)
 
 ReceiveBrokerRegRequest ==
@@ -561,21 +587,23 @@ ReceiveBrokerRegRequest ==
               /\ con_broker_state[m.source].incarnation_id = m.incarnation_id
         \* state mutations
         /\ LET b              == m.source
-               broker_epoch   == Len(con_metadata_log) + 1
+               broker_epoch   == aux_broker_epoch + 1
             IN
                 /\ con_broker_state' = [con_broker_state EXCEPT ![b] =
-                                            [status              |-> FENCED,
+                                            [status              |-> UNFENCED,  \* TODO: review this
                                              broker_epoch        |-> broker_epoch,
                                              incarnation_id      |-> m.incarnation_id]]
                 \* this simplified version omits BrokerRegistrationRecords
                 /\ con_metadata_log' = con_metadata_log 
+                /\ con_unfenced' = con_unfenced \union {b} \* TODO: review this
                 /\ Reply(m, 
                         [type         |-> RegisterBrokerResponse,
                          broker_epoch |-> broker_epoch,
                          dest         |-> b,
                          source       |-> Controller])
+                /\ aux_broker_epoch' = aux_broker_epoch + 1 \* used instead of metadata offset
                 /\ UNCHANGED << broker_vars, replica_vars, con_part_state,
-                                con_unfenced, inv_vars, aux_vars >>
+                                inv_vars, aux_ctrs >>
 
 (*---------------------------------------------------------------
   ACTION: ReceiveBrokerRegResponse
@@ -583,10 +611,18 @@ ReceiveBrokerRegRequest ==
   A broker receives a RegisterBrokerResponse and updates its 
   broker epoch and registered state. 
 
-  In this simplified version, the broker jumps straight
-  to RUNNING. The process of catching up to its own 
-  BrokerRegistrationRecord in the metadata log and sending heartbeats
-  is omitted.
+  In this simplified spec, the full start-up sequence is omitted
+  which results in the following differences:
+  - The broker jumps straight to RUNNING.
+  - The broker cannot catch-up with its own BrokerRegistration
+    record as we do not model those in this spec. Therefore,
+    there are scenarios where the broker is already caught up 
+    with metadata and the partition replica remains uninitialized. 
+    Therefore, in order to force the replica to properly initialize
+    (may be truncate, then become a follower or even a leader),
+    we artificially wipe the metadata log which will enable the
+    metadata update action so the replica will eventually initialize.
+    
 ----------------------------------------------------------------*)
 
 ReceiveBrokerRegResponse ==
@@ -600,9 +636,9 @@ ReceiveBrokerRegResponse ==
                                  broker_epoch   |-> m.broker_epoch,
                                  incarnation_id |-> broker_state[m.dest].incarnation_id,
                                  registered     |-> TRUE]]
+        /\ broker_metadata_log' = [broker_metadata_log EXCEPT ![m.dest] = <<>>]
         /\ Discard(m)
-        /\ UNCHANGED << con_vars, replica_vars, broker_metadata_log, 
-                        inv_vars, aux_vars >>
+        /\ UNCHANGED << con_vars, replica_vars, inv_vars, aux_vars >>
 
 (*--------------------------------------------------------------------
   ACTION: UnfenceBroker
@@ -686,7 +722,7 @@ UnfenceBroker ==
         /\ HandleBrokerUnfenced(b, con_broker_state[b])
         /\ con_broker_state' = [con_broker_state EXCEPT ![b].status = UNFENCED]
         /\ UNCHANGED << broker_vars, replica_vars, messages, inv_vars, 
-                        aux_ctrs >>
+                        aux_vars >>
 
 (*--------------------------------------------------------------------
   ACTION: FenceBroker
@@ -714,7 +750,8 @@ FenceBroker ==
         /\ HandleBrokerFenced(b, con_broker_state[b])
         /\ con_broker_state' = [con_broker_state EXCEPT ![b].status = FENCED]
         /\ aux_ctrs' = [aux_ctrs EXCEPT !.fence_stale_ctr = @ + 1]
-        /\ UNCHANGED << broker_vars, replica_vars, messages, inv_vars >>
+        /\ UNCHANGED << broker_vars, replica_vars, messages, inv_vars,
+                        aux_broker_epoch >>
 
 (*-----------------------------------------------------------------------
   ACTION: ReceiveMetadataPartitionChangeRecords
@@ -783,7 +820,7 @@ NextRecords(index) ==
 RemainLeader(b, new_part_state) ==
     /\ MaybeUpdateHwmOnPartitionChange(b, new_part_state)
     /\ UNCHANGED << replica_status, replica_replica_state, 
-                    replica_fetch_state, replica_pending_ap_epoch>>
+                    replica_fetch_state, replica_pending_ap>>
     
 BecomeLeader(b) ==
     /\ replica_status' = [replica_status EXCEPT ![b] = Leader]
@@ -794,7 +831,7 @@ BecomeLeader(b) ==
     /\ StopFetcher(b)
     /\ UNCHANGED << inv_vars >>
     
-BecomeFollower(b, log, hwm, new_part_state) ==
+TruncateAndBecomeFollower(b, log, hwm, new_part_state) ==
     LET new_part_data == TruncateToSafePoint(b, log, hwm, new_part_state)
     IN
         /\ MaybeFailPendingWrites(b, new_part_state)
@@ -803,7 +840,7 @@ BecomeFollower(b, log, hwm, new_part_state) ==
         /\ ResetReplicaState(b)
         /\ StartFetcher(b, new_part_state.leader_epoch, new_part_data.leo)
         /\ ResetPendingAlterPartition(b)
-        /\ UNCHANGED << inv_hwm, inv_consumed >>
+        /\ UNCHANGED << inv_true_hwm, inv_consumed >>
     
 SwitchToTruncating(b, new_part_state) ==
     /\ MaybeFailPendingWrites(b, new_part_state)
@@ -811,7 +848,7 @@ SwitchToTruncating(b, new_part_state) ==
     /\ ResetReplicaState(b)
     /\ ResetPendingAlterPartition(b)
     /\ StopFetcher(b)
-    /\ UNCHANGED << replica_part_data, inv_hwm, inv_consumed >>
+    /\ UNCHANGED << replica_part_data, inv_true_hwm, inv_consumed >>
     
 WaitForLeaderChange(b, new_part_state) ==
     /\ MaybeFailPendingWrites(b, new_part_state)
@@ -819,7 +856,7 @@ WaitForLeaderChange(b, new_part_state) ==
     /\ ResetPendingAlterPartition(b)
     /\ StopFetcher(b)
     /\ UNCHANGED << replica_part_data, replica_replica_state, 
-                    inv_hwm, inv_consumed >>
+                    inv_true_hwm, inv_consumed >>
 
 ReceiveMetadataPartitionChangeRecords ==
     \E b \in Brokers :
@@ -850,14 +887,16 @@ ReceiveMetadataPartitionChangeRecords ==
                     /\ replica_part_state' = [replica_part_state EXCEPT ![b] = new_part_state]
                     /\ CASE /\ replica_part_state[b].leader = b
                             /\ last_pc_record.leader = b -> 
-                                RemainLeader(b, new_part_state)
+                                IF replica_part_state[b].leader_epoch = new_part_state.leader_epoch
+                                THEN RemainLeader(b, new_part_state)
+                                ELSE BecomeLeader(b)
                          [] /\ replica_part_state[b].leader # b
                             /\ last_pc_record.leader = b ->
                                 BecomeLeader(b)
                          [] /\ last_pc_record.leader # NoLeader
                             /\ can_truncate ->
                                 \* this includes truncation then switching to follower
-                                BecomeFollower(b, 
+                                TruncateAndBecomeFollower(b, 
                                            replica_part_data[b].log,
                                            replica_part_data[b].hwm,
                                            new_part_state)
@@ -866,7 +905,7 @@ ReceiveMetadataPartitionChangeRecords ==
                                 SwitchToTruncating(b, new_part_state)
                          [] OTHER -> WaitForLeaderChange(b, new_part_state)
                ELSE UNCHANGED << replica_vars, inv_vars >>
-            /\ UNCHANGED << con_vars, broker_state, messages, aux_ctrs >>
+            /\ UNCHANGED << con_vars, broker_state, messages, aux_vars >>
 
 (*-------------------------------------------------------------------------
   ACTION: DelayedTruncateAsFollower
@@ -889,13 +928,15 @@ DelayedTruncateAsFollower ==
         /\ __RemoteBrokerKnowsItIsLeader(replica_part_state[b].leader,
                                          replica_part_state[b].leader_epoch)
         \* state mutations
-        /\ BecomeFollower(b, 
+        /\ TruncateAndBecomeFollower(b, 
                           replica_part_data[b].log,
                           replica_part_data[b].hwm,
                           replica_part_state[b])
         /\ replica_status' = [replica_status EXCEPT ![b] = Follower]
         /\ UNCHANGED << con_vars, broker_state, broker_metadata_log, replica_part_state,
-                        replica_replica_state, messages, aux_ctrs >>
+                        replica_replica_state, messages, aux_vars >>
+
+
 
 (*--------------------------------------------------------------------------
   ACTION: SendAlterPartitionRequest
@@ -923,7 +964,7 @@ IsrAndEpochs(b, isr) ==
                     ELSE replica_replica_state[b][b1].broker_epoch]
 
 PendingAlterPartitionResponse(b) ==
-    replica_pending_ap_epoch[b] > replica_part_state[b].partition_epoch
+    replica_pending_ap[b].epoch > replica_part_state[b].partition_epoch
 
 FollowerIsCaughtUp(b, follower, timed_out_followers) ==
     /\ replica_replica_state[b][follower].leo >= replica_part_data[b].hwm
@@ -942,26 +983,28 @@ SendAlterPartitionRequest ==
             /\ LET curr_isr     == replica_part_state[b].isr
                    proposed_isr == { b1 \in Brokers : \/ b1 = b 
                                                       \/ FollowerIsCaughtUp(b, b1, timed_out_followers) }
+                   ap_request   == [type            |-> AlterPartitionRequest,
+                                    isr             |-> proposed_isr,
+                                    isr_and_epochs  |-> IsrAndEpochs(b, proposed_isr),
+                                    leader          |-> b,
+                                    leader_epoch    |-> replica_part_state[b].leader_epoch,
+                                    partition_epoch |-> replica_part_state[b].partition_epoch,
+                                    broker_epoch    |-> broker_state[b].broker_epoch,
+                                    source          |-> b,
+                                    dest            |-> Controller]
                IN 
                   /\ proposed_isr # curr_isr
                   \* state mutations
-                  /\ Send([type            |-> AlterPartitionRequest,
-                           isr             |-> proposed_isr,
-                           isr_and_epochs  |-> IsrAndEpochs(b, proposed_isr),
-                           leader          |-> b,
-                           leader_epoch    |-> replica_part_state[b].leader_epoch,
-                           partition_epoch |-> replica_part_state[b].partition_epoch,
-                           broker_epoch    |-> broker_state[b].broker_epoch,
-                           source          |-> b,
-                           dest            |-> Controller])
+                  /\ Send(ap_request)
                   /\ replica_part_state' = [replica_part_state EXCEPT ![b].maximal_isr = 
                                                proposed_isr \union curr_isr]
-                  /\ replica_pending_ap_epoch' = [replica_pending_ap_epoch EXCEPT ![b] = 
-                                                    replica_part_state[b].partition_epoch + 1]
+                  /\ replica_pending_ap' = [replica_pending_ap EXCEPT ![b] = 
+                                                    [epoch   |-> replica_part_state[b].partition_epoch + 1,
+                                                     request |-> ap_request]]
                   /\ aux_ctrs' = [aux_ctrs EXCEPT !.alter_part_ctr = @ + 1]
                   /\ UNCHANGED << con_vars, broker_metadata_log, broker_state,  
                                     replica_part_data, replica_fetch_state, replica_replica_state,
-                                    replica_status, inv_vars >>
+                                    replica_status, inv_vars, aux_broker_epoch >>
 
 (*--------------------------------------------------------------------------
   ACTION: ReceiveAlterPartitionRequest
@@ -991,6 +1034,16 @@ EligibleIsr(m) ==
     \A b \in DOMAIN m.isr_and_epochs :
         IsEligibleBroker(b, m.isr_and_epochs[b])    
 
+ValidateRequest(b, m) ==
+    IF /\ b = con_part_state.leader
+       /\ m.broker_epoch = con_broker_state[b].broker_epoch
+       /\ m.partition_epoch = con_part_state.partition_epoch
+       /\ m.leader_epoch = con_part_state.leader_epoch
+    THEN IF EligibleIsr(m)
+         THEN Nil
+         ELSE IneligibleReplica
+    ELSE FencedEpoch
+
 ReceiveAlterPartitionRequest ==
     \E m \in DOMAIN messages : 
         \* enabling conditions
@@ -998,13 +1051,10 @@ ReceiveAlterPartitionRequest ==
         /\ LET b == m.source
                new_ldr_epoch  == con_part_state.leader_epoch \* unchanged
                new_part_epoch == con_part_state.partition_epoch +1
+               error          == ValidateRequest(b, m)
            IN
-              /\ b = con_part_state.leader
-              /\ m.broker_epoch = con_broker_state[b].broker_epoch
-              /\ m.partition_epoch = con_part_state.partition_epoch
-              /\ m.leader_epoch = con_part_state.leader_epoch
               \* state mutations
-              /\ IF EligibleIsr(m)
+              /\ IF error = Nil
                  THEN 
                       /\ con_part_state' = [isr             |-> m.isr,
                                             leader          |-> m.leader,
@@ -1023,15 +1073,13 @@ ReceiveAlterPartitionRequest ==
                                leader          |-> m.leader,
                                leader_epoch    |-> new_ldr_epoch,
                                partition_epoch |-> new_part_epoch,
+                               request         |-> m, \* not actually part of the message, a trick used for correlation
                                dest            |-> b,
                                source          |-> Controller])
                  ELSE Reply(m,
                             [type            |-> AlterPartitionResponse,
-                             error           |-> IneligibleReplica,
-                             isr             |-> con_part_state.isr,
-                             leader          |-> con_part_state.leader,
-                             leader_epoch    |-> con_part_state.leader_epoch,
-                             partition_epoch |-> con_part_state.partition_epoch,
+                             error           |-> error,
+                             request         |-> m, \* not actually part of the message, a trick used for correlation
                              dest            |-> b,
                              source          |-> Controller])
                     /\ UNCHANGED << con_part_state, con_metadata_log>>
@@ -1076,16 +1124,19 @@ ReceiveAlterPartitionResponse ==
               /\ broker_state[b].status = RUNNING
               /\ replica_status[b] = Leader
               /\ PendingAlterPartitionResponse(b)
-              /\ m.partition_epoch > replica_part_state[b].partition_epoch
+              /\ replica_pending_ap[b].request = m.request
+              /\ IF m.error = Nil
+                 THEN m.partition_epoch > replica_part_state[b].partition_epoch
+                 ELSE TRUE
               \* state mutations
-              /\ IF m.error = Nil \* only IneligibleReplica error is modeled at the moment
+              /\ IF m.error = Nil 
                  THEN CompletePartitionChange(b, m)
                  ELSE RollbackPartitionChange(b)
               /\ ResetPendingAlterPartition(b)
               /\ Discard(m)
         /\ UNCHANGED << con_vars, broker_vars, replica_replica_state, 
                         replica_fetch_state, replica_status, 
-                        aux_ctrs >>
+                        aux_vars >>
 
 (*-----------------------------------------------------------------------
   ACTION: SendFetchRequest
@@ -1113,7 +1164,7 @@ SendFetchRequest ==
                  source       |-> b])
         /\ replica_fetch_state' = [replica_fetch_state EXCEPT ![b].pending_response = TRUE]
         /\ UNCHANGED << con_vars, broker_vars, replica_part_state, replica_part_data,
-                        replica_replica_state, replica_status, replica_pending_ap_epoch,
+                        replica_replica_state, replica_status, replica_pending_ap,
                         inv_vars, aux_vars >>
         
 (*----------------------------------------------------------------------------
@@ -1142,6 +1193,7 @@ ReceiveFetchRequest ==
               /\ broker_state[b].status = RUNNING
               /\ replica_status[b] = Leader
               /\ replica_part_state[b].leader_epoch = m.leader_epoch
+              /\ replica_replica_state[b][m.source].broker_epoch <= m.broker_epoch
               /\ __NeedFetchRequestForProgress(b, m)
               \* state mutations
               /\ MaybeAdvanceHighWatermark(b, old_hwm, new_hwm)
@@ -1159,7 +1211,7 @@ ReceiveFetchRequest ==
                          dest         |-> m.source,
                          source       |-> m.dest])
               /\ UNCHANGED << con_vars, broker_vars, replica_part_state, replica_status,
-                              replica_fetch_state, replica_pending_ap_epoch, aux_vars >>        
+                              replica_fetch_state, replica_pending_ap, aux_vars >>        
 
 (*-------------------------------------------------------------------
   ACTION: ReceiveFetchResponse
@@ -1195,12 +1247,10 @@ ReceiveFetchResponse ==
               /\ replica_fetch_state' = [replica_fetch_state EXCEPT ![b] =
                                             [fetch_offset     |-> new_leo + 1,
                                              pending_response |-> FALSE]]
-              /\ inv_hwm' = [inv_hwm EXCEPT ![b] = IF m.hwm > inv_hwm[b]
-                                                   THEN m.hwm ELSE inv_hwm[b]]
               /\ Discard(m)
               /\ UNCHANGED << con_vars, broker_vars, replica_part_state, replica_replica_state,
-                              replica_status, replica_pending_ap_epoch,
-                              inv_acked, inv_consumed, aux_vars >> 
+                              replica_status, replica_pending_ap,
+                              inv_vars, aux_vars >> 
 
 (*--------------------------------------------------------------
   ACTION: WriteRecordToLeader
@@ -1230,8 +1280,8 @@ WriteRecordToLeader ==
                                             new_leo]
               /\ inv_acked' = inv_acked @@ (v :> Nil)
               /\ UNCHANGED << con_vars, broker_vars, replica_part_state, replica_status, 
-                              replica_fetch_state, replica_pending_ap_epoch,
-                              messages, aux_vars, inv_hwm, inv_consumed >>
+                              replica_fetch_state, replica_pending_ap,
+                              messages, aux_vars, inv_true_hwm, inv_consumed >>
 
 (*-----------------------------------------------------------------------
   ACTION: UncleanShutdown
@@ -1240,6 +1290,12 @@ WriteRecordToLeader ==
   truncated. Also, in this action, the controller detects the broker 
   is unavailable and fences the broker.
 ---------------------------------------------------------------------*)  
+
+FailPendingWritesIfLeader(b) ==
+    IF /\ replica_status[b] = Leader 
+       /\ replica_part_data[b].hwm < replica_part_data[b].leo
+    THEN FailPendingWrites(b)
+    ELSE UNCHANGED inv_acked
 
 UncleanShutdown ==
     \* enabling conditions
@@ -1263,11 +1319,12 @@ UncleanShutdown ==
                                         [b1 \in Brokers |-> BlankReplicaState]]
         /\ ResetPendingAlterPartition(b)
         /\ aux_ctrs' = [aux_ctrs EXCEPT !.unclean_shutdown_ctr = @ + 1]
+        /\ FailPendingWritesIfLeader(b)
         \* make the controller detect it
         /\ HandleBrokerFenced(b, con_broker_state[b])
         /\ con_broker_state' = [con_broker_state EXCEPT ![b].status = FENCED]
-        /\ UNCHANGED << replica_part_state, broker_metadata_log, inv_vars,
-                        messages >>
+        /\ UNCHANGED << replica_part_state, broker_metadata_log, inv_true_hwm,
+                        inv_consumed, messages, aux_broker_epoch >>
                         
 (*-----------------------------------------------------------------------
   ACTION: CleanShutdown
@@ -1298,11 +1355,12 @@ CleanShutdown ==
                                         [b1 \in Brokers |-> BlankReplicaState]]
         /\ ResetPendingAlterPartition(b)
         /\ aux_ctrs' = [aux_ctrs EXCEPT !.clean_shutdown_ctr = @ + 1]
+        /\ FailPendingWritesIfLeader(b)
         \* make the controller detect it
         /\ HandleBrokerFenced(b, con_broker_state[b])
         /\ con_broker_state' = [con_broker_state EXCEPT ![b].status = FENCED]
-        /\ UNCHANGED << replica_part_state, replica_part_data, broker_metadata_log, inv_vars,
-                        messages >>
+        /\ UNCHANGED << replica_part_state, replica_part_data, broker_metadata_log, 
+                        inv_true_hwm, inv_consumed, messages, aux_broker_epoch >>
 
 \* ===============================================================
 \* INVARIANTS
@@ -1318,7 +1376,8 @@ TypeOK ==
     /\ replica_part_state \in [Brokers -> ReplicaPartitionState]
     /\ replica_fetch_state \in [Brokers -> FetcherState]
     /\ replica_replica_state \in [Brokers -> [Brokers -> ReplicaState]]
-    /\ replica_pending_ap_epoch \in [Brokers -> Nat]
+\*    /\ replica_pending_ap \in [Brokers -> [epoch: Nat, 
+\*                                           request: {Nil, AlterPartitionRequestType}]]
     /\ aux_ctrs \in StateSpaceLimitCtrs
     /\ replica_status \in [Brokers -> {Leader, Follower, Truncating, Nil}]
 
@@ -1359,7 +1418,7 @@ ValidControllerState ==
        ELSE TRUE
     \* The ISR cannot be empty
     /\ con_part_state.isr # {} 
-
+    
 \* INV: ValidLeaderMaximalISR
 \* The maximal ISR is critical for safety. The invariant here is that
 \* the maximal ISR on the (non-stale) leader must be a superset of
@@ -1381,6 +1440,13 @@ ValidLeaderMaximalISR ==
               /\ \A b1 \in con_part_state.isr :
                     b1 \in replica_part_state[b].maximal_isr
         ELSE TRUE
+
+ControllerIsrHasUpToTrueHWM ==
+    \* No member of the ISR is missing committed records
+    \* and is RUNNING 
+    /\ ~\E b \in con_part_state.isr :
+        /\ replica_part_data[b].leo < inv_true_hwm
+        /\ broker_state[b].status = RUNNING
 
 \* INV: LeaderHasCompleteCommittedLog
 \* The replica selected as leader by the controller must have
@@ -1441,14 +1507,6 @@ ConsumedRecordsMatchLeaderLog ==
                 /\ replica_part_data[b].log[offset] = inv_consumed[offset]
         ELSE TRUE
 
-\* Not actually an invariant as the HWM is not monotonic on any
-\* given replica. The "true" high watermark is monotonic but
-\* is not recorded anywhere, it is implicit.    
-HighWatermarkIsMonotonic ==
-    \A b \in Brokers :
-        replica_part_data[b].hwm >= inv_hwm[b]
-        
-
 TestInv ==
     TRUE
         
@@ -1477,9 +1535,9 @@ EventuallyUnfenced ==
 \* reaches the expected partition epoch, or the request is rejected.
 AlterPartitionEpochEventuallyReachedOrZero ==
     []<>(\A b \in Brokers :
-        replica_pending_ap_epoch[b] > 0 ~> 
-            \/ replica_pending_ap_epoch[b] = replica_part_state[b].partition_epoch
-            \/ replica_pending_ap_epoch[b] = 0)
+        replica_pending_ap[b].epoch > 0 ~> 
+            \/ replica_pending_ap[b].epoch = replica_part_state[b].partition_epoch
+            \/ replica_pending_ap[b].epoch = 0)
 
 \* LIVENESS: EventuallyMetadataConverges
 \* Eventually, each broker converges on the same metadata as the controller.
@@ -1582,14 +1640,15 @@ Init ==
                                      pending_response |-> FALSE]]
         /\ replica_replica_state = [b \in Brokers |->
                                         [b1 \in Brokers |-> BlankReplicaState]]
-        /\ replica_pending_ap_epoch = [b \in Brokers |-> 0]
+        /\ replica_pending_ap = [b \in Brokers |-> [epoch |-> 0, request |-> Nil]]
+        /\ aux_broker_epoch = ReplicationFactor
         /\ aux_ctrs = [incarn_ctr           |-> ReplicationFactor + 1,
                        clean_shutdown_ctr   |-> 0,
                        unclean_shutdown_ctr |-> 0,
                        fence_stale_ctr      |-> 0,
                        alter_part_ctr       |-> 0]
         /\ inv_acked = <<>>
-        /\ inv_hwm = [b \in Brokers |-> 0]
+        /\ inv_true_hwm = 0
         /\ inv_consumed = <<>>
         /\ messages = <<>>
 

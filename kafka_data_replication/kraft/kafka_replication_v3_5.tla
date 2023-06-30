@@ -251,12 +251,6 @@ StateSpaceLimitCtrs ==
      fence_stale_ctr: Nat,
      alter_part_ctr: Nat] 
 
-AuxState ==
-    [\* TRUE when the broker is waiting for a heartbeat response
-     pending_hb_res: BOOLEAN, 
-     \* The partition epoch the replica is expecting an AlterPartition response for
-     pending_ap_epoch: Nat]
-
 \* ======================================================================
 \* ------------ Messages type definitions -------------------------------
 
@@ -1088,7 +1082,7 @@ WaitForLeaderChange(b, new_part_state) ==
 ReceiveMetadataUpdate ==
     \E b \in Brokers :
         LET curr_md_offset == Len(broker_metadata_log[b])
-            next_records   == NextRecords(<<>>, curr_md_offset + 1)
+            next_records   == NextRecords(curr_md_offset + 1)
             last_pc_record == LastPartitionChangeRecord(next_records, 
                                                         Len(next_records))
             new_part_state == [isr             |-> last_pc_record.isr,
@@ -1432,6 +1426,7 @@ ReceiveFetchRequest ==
               /\ broker_state[b].status = RUNNING
               /\ replica_status[b] = Leader
               /\ replica_part_state[b].leader_epoch = m.leader_epoch
+              /\ replica_replica_state[b][m.source].broker_epoch <= m.broker_epoch
               /\ __NeedFetchRequestForProgress(b, m)
               \* state mutations
               /\ MaybeAdvanceHighWatermark(b, old_hwm, new_hwm)
