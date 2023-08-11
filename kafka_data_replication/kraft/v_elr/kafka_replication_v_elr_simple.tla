@@ -15,9 +15,10 @@ Eligible Leader Replicas Proposal - Simplified
 Models a proposed change to the replication protocol to enhance the recovery 
 mechanism to better handle unclean shutdowns.
 
-TODO: Describe it.
+KIP has complete description: https://cwiki.apache.org/confluence/display/KAFKA/KIP-966%3A+Eligible+Leader+Replicas
 
-Based on the kafka_replication_v3_5_simple.tla specification.
+Based on the kafka_replication_v3_5_simple.tla specification which omits
+some parts of the protocol such as the complete broker lifecycle and heartbeats.
 
 Jump to the bottom of the spec for the Next state formula which lists all
 the actions.
@@ -86,15 +87,19 @@ BrokerStart ==
      the existing registration.
    
    ++ PROPOSAL CHANGE +++++++++++++++++++++++++++++
-   In this proposal, if the request has a broker has an existing
-   broker registration but passes an epoch of 0 in its registration
-   request, the controller treats the broker as unclean. 
+   In this proposal, if the request is from a broker with an existing
+   broker registration but the broker_epoch of the request is 0,
+   then the controller treats the broker as unclean. 
    
    Whether clean or unclean, the broker is assigned a broker epoch based
    on the last offset in the metadata log.
        
    If the broker is unclean, the broker is removed from partition
    leadership and any ISRs and ELRs (regardless of the MinISR).
+   
+   A broker is only removed from the ELR when either it starts up
+   unclean, or it gets elected leader, or the combined size of the
+   ISR + ELR > MinISR.
    +++++++++++++++++++++++++++++++++++++++++++++++++
    
    In this simplified spec, the full start-up sequence is omitted
@@ -205,7 +210,7 @@ ReceiveBrokerRegResponse ==
   allows this to occur at any time to a fenced broker.
 
   ++ PROPOSAL CHANGE ++++++++++++++++++++++++++++++++++++
-  The replicas of unfenced broker will remain outside of the
+  The replicas of unfenced the broker will remain outside of the
   ISR unless:
     1. There is no current leader (ISR is empty).
     2. The replica is in the ELR.
@@ -555,7 +560,7 @@ SendAlterPartitionRequest ==
         partition change is a shrinkage, then add replicas
         that have been removed such that the ISR + ELR = MinISR.
         (Note this is safe because when ISR < Min ISR the
-        hig watermark cannot advance.)
+        high watermark cannot advance.)
   ++++++++++++++++++++++++++++++++++++++++++++++++++++    
 ---------------------------------------------------------------------------*)
 
@@ -751,7 +756,7 @@ SendFetchRequest ==
         the maximal ISR was a superset of the ISR known to
         the controller. Basically, the controller couldn't
         elect a replica that was not part of the leader's
-        ISR.
+        maximal ISR.
         However, now the controller elects from the ISR + 
         ELR and the leader has no knowledge of the ELR. The
         maximal ISR may not be superset of the ISR + ELR
@@ -762,8 +767,11 @@ SendFetchRequest ==
         high watermark cannot advance.
      2. Before the ELR, if the last replica standing went
         down, then only it could be elected leader. That
-        meant it was safe for the leader to advance the
-        high watermark even though the ISR was 1 replica.
+        meant as long as the leader came back intact, then
+        it was ok for the leader to advance the high watermark 
+        even though the ISR was 1 replica (as we guaranteed that
+        the same replica that advanced the high watermark became
+        leader again).
         However, with the ELR, if the last replica standing
         goes down, it is possible a different replica (from
         the ELR) gets elected. If the former leader had advanced
@@ -1083,7 +1091,7 @@ UncleanShutdown ==
   shutdown sequence.
 
   ++ PROPOSAL CHANGES ++++++++++++++++++++++++++++++++
-  The broker writes its broker epoch to a file.
+  The broker writes its broker epoch to a file on shutdown.
   ++++++++++++++++++++++++++++++++++++++++++++++++++++
 ---------------------------------------------------------------------*)  
 
@@ -1118,7 +1126,7 @@ CleanShutdown ==
 \* The cluster starts in an already established state.
 \* When InitIsrSize < ReplicationFactor then a subset of broker start outside 
 \* of the ISR with a stale partiion_epoch. This allows us to explore
-\* more state space.
+\* more state space by initializing the cluster with a smaller ISR.
 
 Init ==
     LET init_isr   == CHOOSE isr \in SUBSET Brokers :
@@ -1230,20 +1238,6 @@ Next ==
 \* We only need actions that help the cluster make progress and
 \* recover from failures here.
 Liveness ==
-    /\ WF_vars(BrokerStart)
-    /\ WF_vars(ReceiveBrokerRegResponse)
-    /\ WF_vars(ReceiveMetadataUpdate)
-    /\ WF_vars(SendAlterPartitionRequest)
-    /\ WF_vars(ReceiveAlterPartitionResponse)
-    /\ WF_vars(SendFetchRequest)
-    /\ WF_vars(ReceiveFetchRequest)
-    /\ WF_vars(ReceiveFetchResponse)
-    /\ WF_vars(WriteRecordToLeader)
-    /\ WF_vars(ReceiveBrokerRegRequest)
-    /\ WF_vars(ReceiveAlterPartitionRequest)
-    /\ WF_vars(UnfenceBroker)
-    
-Liveness2 ==
     WF_vars(\/ BrokerStart
             \/ ReceiveBrokerRegResponse
             \/ ReceiveMetadataUpdate
@@ -1258,5 +1252,5 @@ Liveness2 ==
             \/ UnfenceBroker)    
     
 Spec == Init /\ [][Next]_vars
-LivenessSpec == Init /\ [][Next]_vars /\ Liveness2   
+LivenessSpec == Init /\ [][Next]_vars /\ Liveness
 =============================================================================
