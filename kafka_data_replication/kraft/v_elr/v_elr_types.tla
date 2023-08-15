@@ -12,7 +12,9 @@ CONSTANTS ReplicationFactor, \* the number of replicas (and brokers).
 CONSTANTS CleanShutdownLimit,       \* limits the number of clean shutdowns
           UncleanShutdownLimit,     \* limits the number of unclean shutdowns
           FenceBrokerLimit,         \* limits the number of times the controller arbitrarily fences a broker
-          AlterPartitionLimit       \* limits the number of AlterPartition requests that can be sent
+          AlterPartitionLimit,      \* limits the number of AlterPartition requests that can be sent
+          LimitFetchesOnLeaderEpoch \* limits the state space by reducing the number of FencedLeaderEpoch and
+                                    \* UnknownLeaderEpochs errors from fetch requests
 
 \* Controller-side broker statuses
 CONSTANTS FENCED,           

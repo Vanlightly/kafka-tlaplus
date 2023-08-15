@@ -328,8 +328,29 @@ RemovePartitionFromFetchers(b) ==
 NoFetcherChanges ==
     UNCHANGED broker_fetchers
 
-NextMetadataRecord(index) ==
-    con_metadata_log[index]
+IsLeaderEpochBump(b, md_offset) ==
+    con_metadata_log[md_offset].leader_epoch > PartitionMetadata(b).leader_epoch
+
+\* As leader we care about every partition change but as follower
+\* we only care about leader epoch changes (as a state space reduction).
+ExistMetadataUpdates(b) ==
+    /\ Len(broker_metadata_log[b]) < Len(con_metadata_log)
+    /\ IF partition_status[b] = Leader
+       THEN TRUE
+       ELSE \E md_offset \in Len(broker_metadata_log[b])+1..Len(con_metadata_log) :
+                IsLeaderEpochBump(b, md_offset)
+       
+
+\* As leader we care about every partition change but as follower
+\* we only care about leader epoch changes (as a state space reduction)
+\* so we skip any records that are ISR only changes.
+RECURSIVE NextMetadataRecord(_,_)
+NextMetadataRecord(b, md_offset) ==
+    IF \/ partition_status[b] = Leader 
+       \/ IsLeaderEpochBump(b, md_offset)
+    THEN [record |-> con_metadata_log[md_offset],
+          offset |-> md_offset]
+    ELSE NextMetadataRecord(b, md_offset + 1)
     
 \* Ensure all state related to former leadership is clear    
 EnsureLeadershipRenounced(b, new_part_md) ==
@@ -387,20 +408,21 @@ MetadataNoOp ==
 ReceiveMetadataUpdate ==
     \E b \in Brokers :
         LET curr_md_offset == Len(broker_metadata_log[b])
-            pc_record      == NextMetadataRecord(curr_md_offset + 1)
+            metadata       == NextMetadataRecord(b, curr_md_offset + 1)
+            append_records == SubSeq(con_metadata_log, curr_md_offset + 1, metadata.offset) 
             curr_part_md   == PartitionMetadata(b)
-            new_part_md    == [isr             |-> pc_record.isr,
-                               maximal_isr     |-> pc_record.isr,
-                               leader          |-> pc_record.leader,
-                               leader_epoch    |-> pc_record.leader_epoch,
-                               partition_epoch |-> pc_record.partition_epoch]
+            new_part_md    == [isr             |-> metadata.record.isr,
+                               maximal_isr     |-> metadata.record.isr,
+                               leader          |-> metadata.record.leader,
+                               leader_epoch    |-> metadata.record.leader_epoch,
+                               partition_epoch |-> metadata.record.partition_epoch]
         IN
             \* enabling conditions
+            /\ ExistMetadataUpdates(b)
             /\ broker_state[b].status \notin {OFFLINE_CLEAN, OFFLINE_DIRTY}
             /\ broker_state[b].registered = TRUE
-            /\ curr_md_offset < Len(con_metadata_log) \* there are metadata records to receive
             \* state mutations
-            /\ broker_metadata_log' = [broker_metadata_log EXCEPT ![b] = Append(@, pc_record)]
+            /\ broker_metadata_log' = [broker_metadata_log EXCEPT ![b] = @ \o append_records]
                \* If the last PartitionChangeRecord has a higher partition epoch, then update 
                \* the local partition state and possibly become a leader or follower.
                \* The partition epoch will not be lower if the change is the result of a completed
@@ -411,7 +433,7 @@ ReceiveMetadataUpdate ==
                     /\ CASE 
                          \* CASE --- Remains leader --------------------------------
                             /\ PartitionMetadata(b).leader = b
-                            /\ pc_record.leader = b -> 
+                            /\ metadata.record.leader = b -> 
                                 IF PartitionMetadata(b).leader_epoch = new_part_md.leader_epoch
                                 THEN \* Remains leader in the same leader epoch
                                      RemainLeader(b, new_part_md)
@@ -419,10 +441,10 @@ ReceiveMetadataUpdate ==
                                      BecomeLeaderInNewEpoch(b)
                          \* CASE --- Follower elected as leader----------------------
                          [] /\ PartitionMetadata(b).leader # b
-                            /\ pc_record.leader = b ->
+                            /\ metadata.record.leader = b ->
                                 BecomeLeaderInNewEpoch(b)
                          \* CASE --- Chosen as a follower ---------------------------
-                         [] /\ pc_record.leader # NoLeader ->
+                         [] /\ metadata.record.leader # NoLeader ->
                                 IF /\ new_part_md.leader_epoch = curr_part_md.leader_epoch
                                    /\ curr_part_md.leader # b
                                    /\ new_part_md.leader # b
@@ -716,7 +738,7 @@ SendFetchRequest ==
         /\ Fetcher(from, to).pending_response = FALSE  \* The fetcher is not waiting for a response
         /\ PartitionMetadata(from).leader = to         \* This replica believes the destination 
                                                        \* broker hosts the leader replica
-        /\ __FetchMakesProgress(from) \* prevents infinite cycles
+        /\ __SendFetchMakesProgress(from) \* prevents infinite cycles
         \* state mutations
         /\ Send([type               |-> FetchRequest,
                  broker_epoch       |-> broker_state[from].broker_epoch,
@@ -785,6 +807,7 @@ ReceiveFetchRequest ==
     \E m \in DOMAIN messages :
         \* enabling conditions
         /\ ReceivableMsg(m, FetchRequest)
+        /\ __ReceiveFetchMakesProgress(m)
         /\ LET b          == m.dest
                last_epoch == LastOffsetForEpoch(b, m.partition.last_fetched_epoch, TRUE)
            IN

@@ -82,14 +82,20 @@ PendingAlterPartitionResponse(b) ==
 \* if sending a fetch helps progress - else it will only enable a cycle. 
 \* This requires **great care** to avoid hiding legal behaviors that could
 \* result in invariant or liveness violations.
-__FetchMakesProgress(b) ==
+__SendFetchMakesProgress(b) ==
     LET leader == PartitionMetadata(b).leader
-    IN \* If the partition has a fetch delay due to a prior error,
-       \* then delay until both replicas are on the same leader epoch 
-       \* (else we get an infinite cycle)
-       /\ \/ broker_fetchers[b][leader].partition.delayed = FALSE
-          \/ PartitionMetadata(b).leader_epoch = PartitionMetadata(leader).leader_epoch
-       \* one of the following is true:
+        matching_epoch == PartitionMetadata(b).leader_epoch = PartitionMetadata(leader).leader_epoch
+    IN \* Limit when fetch requests can be sent according to the leader epoch on leader and follower
+       /\ CASE 
+            \* --- CASE Delayed partition but leader epoch doesn't match ------------------------
+               /\ broker_fetchers[b][leader].partition.delayed = TRUE
+               /\ matching_epoch = FALSE -> FALSE
+            \* --- CASE Model limits fetch requests to matching epoch but epochs don't match ----
+            [] /\ LimitFetchesOnLeaderEpoch = TRUE
+               /\ matching_epoch = FALSE -> FALSE
+            \* --- CASE else we can send the fetch
+            [] OTHER -> TRUE
+       \* One of the following is true:
        /\ \* leader has records to get
           \/ LeoOf(b) < LeoOf(leader)
           \* leader has hwm to get                  
@@ -99,6 +105,15 @@ __FetchMakesProgress(b) ==
           \* leader doesn't know current leo of this follower   
           \/ /\ ReplicaState(leader, b).leo # Nil   
              /\ ReplicaState(leader, b).leo < LeoOf(b)
+
+\* This prevents a replica from processing a fetch request with a larger leader
+\* epoch than its own. It shouldn't cause liveness issues as eventually the
+\* replica will learn of the new leader epoch.
+__ReceiveFetchMakesProgress(m) ==
+    IF /\ LimitFetchesOnLeaderEpoch = TRUE
+       /\ PartitionMetadata(m.source).leader_epoch > PartitionMetadata(m.dest).leader_epoch
+    THEN FALSE
+    ELSE TRUE
 
 \* A magic formula where we see the state of both replicas. TRUE if
 \* sending an AppendRecords will help the partition make progress -
