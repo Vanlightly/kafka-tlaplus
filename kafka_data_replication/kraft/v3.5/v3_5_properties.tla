@@ -20,6 +20,9 @@ TypeOK ==
     /\ partition_replica_state \in [Brokers -> [Brokers -> PeerReplicaState]]
     /\ aux_ctrs \in StateSpaceLimitCtrs
     /\ partition_status \in [Brokers -> {Leader, Follower, Nil}]
+    /\ inv_sent \in SUBSET Values
+    /\ inv_pos_acked \in SUBSET Values
+    /\ inv_neg_acked \in SUBSET Values
 
 \* INV: ValidBrokerState
 \* For catching spec bugs, ensure broker state is legal.

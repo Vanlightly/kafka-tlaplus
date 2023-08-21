@@ -12,7 +12,10 @@ CONSTANTS ReplicationFactor, \* the number of replicas (and brokers).
 CONSTANTS CleanShutdownLimit,       \* limits the number of clean shutdowns
           UncleanShutdownLimit,     \* limits the number of unclean shutdowns
           FenceBrokerLimit,         \* limits the number of times the controller arbitrarily fences a broker
-          AlterPartitionLimit       \* limits the number of AlterPartition requests that can be sent
+          AlterPartitionLimit,      \* limits the number of AlterPartition requests that can be sent
+          AvoidLastReplicaStanding, \* When TRUE, does not follow actions that result in the LRS issue.
+          LimitFetchesOnLeaderEpoch \* limits the state space by reducing the number of FencedLeaderEpoch and
+                                    \* UnknownLeaderEpochs errors from fetch requests
 
 \* Controller-side broker statuses
 CONSTANTS FENCED,           
@@ -75,6 +78,7 @@ VARIABLES broker_state,         \* state of each broker, such as status (RUNNING
 VARIABLES partition_status,         \* the role (leader, follower) and replication mode.
           partition_metadata,       \* the partition metadata state on each replica.
           partition_data,           \* the actual partition data, including HWM.
+          partition_leso,           \* the Leader Epoch Start Offset set by the leader of its leader epoch
           partition_replica_state,  \* a map (used by the leader) to track the state of follower replicas.
           partition_pending_ap      \* info related to a pending AlterPartition request.
 
@@ -94,7 +98,7 @@ con_broker_vars == << con_unfenced, con_broker_reg >>
 con_vars == << con_metadata_log,  con_broker_vars, con_partition_metadata >>
 broker_vars == << broker_state, broker_fetchers, broker_metadata_log >>
 part_vars == << partition_status, partition_metadata, partition_data,
-                partition_replica_state, partition_pending_ap >>
+                partition_leso, partition_replica_state, partition_pending_ap >>
 inv_vars == << inv_sent, inv_pos_acked, inv_neg_acked, inv_true_hwm, inv_consumed >>
 aux_vars == << aux_broker_epoch, aux_ctrs >>    
 
@@ -156,8 +160,9 @@ PartitionLog ==
 PartitionDataType ==
     [log: PartitionLog,
      hwm: Nat,
-     leo: Nat,
-     epoch_start_offset: Nat \union {Nil}]
+     leo: Nat]
+
+PartitionLESO == Nat \union {Nil}
      
 StateSpaceLimitCtrs ==
     [incarn_ctr: Nat,

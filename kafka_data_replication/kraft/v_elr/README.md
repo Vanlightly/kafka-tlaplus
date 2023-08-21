@@ -18,6 +18,7 @@ CleanShutdownLimit = 0
 UncleanShutdownLimit = 1
 FenceBrokerLimit = 1
 AlterPartitionLimit = 1
+LimitFetchesOnLeaderEpoch = TRUE
 ```
 
 ## Simulation mode

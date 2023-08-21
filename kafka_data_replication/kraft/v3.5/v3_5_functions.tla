@@ -48,14 +48,10 @@ BlankReplicaState ==
 
 \* A replica resets its peer replica state when it changes role.
 \* If it has become a leader then it sets its own replica state as this
-\* spec uses that when computing the HWM advancement.
-ResetReplicaState(b, is_leader) ==
+\* spec uses that when computing the HWM advancement.    
+ResetReplicaState(b) ==
     partition_replica_state' = [partition_replica_state EXCEPT ![b] = 
-                                [b1 \in Brokers |-> 
-                                    IF b1 = b /\ is_leader
-                                    THEN [leo              |-> LeoOf(b),
-                                          broker_epoch     |-> broker_state[b].broker_epoch]
-                                    ELSE BlankReplicaState]]
+                                    [b1 \in Brokers |-> BlankReplicaState]]
 
 \* partition_pending_ap is used by the spec to know when it is pending 
 \* an AP request. If the epoch is higher than the current partition epoch
@@ -82,13 +78,19 @@ PendingAlterPartitionResponse(b) ==
 \* if sending a fetch helps progress - else it will only enable a cycle. 
 \* This requires **great care** to avoid hiding legal behaviors that could
 \* result in invariant or liveness violations.
-__FetchMakesProgress(b) ==
+__SendFetchMakesProgress(b) ==
     LET leader == PartitionMetadata(b).leader
-    IN \* If the partition has a fetch delay due to a prior error,
-       \* then delay until both replicas are on the same leader epoch 
-       \* (else we get an infinite cycle)
-       /\ \/ broker_fetchers[b][leader].partition.delayed = FALSE
-          \/ PartitionMetadata(b).leader_epoch = PartitionMetadata(leader).leader_epoch
+        matching_epoch == PartitionMetadata(b).leader_epoch = PartitionMetadata(leader).leader_epoch
+    IN \* Limit when fetch requests can be sent according to the leader epoch on leader and follower
+       /\ CASE 
+            \* --- CASE Delayed partition but leader epoch doesn't match ------------------------
+               /\ broker_fetchers[b][leader].partition.delayed = TRUE
+               /\ matching_epoch = FALSE -> FALSE
+            \* --- CASE Model limits fetch requests to matching epoch but epochs don't match ----
+            [] /\ LimitFetchesOnLeaderEpoch = TRUE
+               /\ matching_epoch = FALSE -> FALSE
+            \* --- CASE else we can send the fetch
+            [] OTHER -> TRUE
        \* one of the following is true:
        /\ \* leader has records to get
           \/ LeoOf(b) < LeoOf(leader)
@@ -100,45 +102,62 @@ __FetchMakesProgress(b) ==
           \/ /\ ReplicaState(leader, b).leo # Nil   
              /\ ReplicaState(leader, b).leo < LeoOf(b)
 
-\* A magic formula where we see the state of both replicas. TRUE if
-\* sending an AppendRecords will help the partition make progress -
-\* else it will only enable a cycle.
-__AppendMakesProgress(b, follower) ==
-    \* follower needs to learn of an HWM change                  
-    HwmOf(b) # HwmOf(follower)
+\* This prevents a replica from processing a fetch request with a larger leader
+\* epoch than its own. It shouldn't cause liveness issues as eventually the
+\* replica will learn of the new leader epoch.
+__ReceiveFetchMakesProgress(m) ==
+    IF /\ LimitFetchesOnLeaderEpoch = TRUE
+       /\ m.partition.leader_epoch > PartitionMetadata(m.dest).leader_epoch
+    THEN FALSE
+    ELSE TRUE
 
-__MetadataCaughtUp(b) ==
-    Len(broker_metadata_log[b]) = Len(con_metadata_log)
+
 
 \* ======================================================================
 \* ------------ Key functions -------------------------------------------
 \* These functions may be used in multiple places.
 
 \*----------------------------------------------------
-\* FUNCTION: HighestCommitted
+\* FUNCTION: CommitOffsetOnFetch, CommitOffsetOnUpdate, CommitOffsetOnWrite
 \*
 \* Find the highest (contiguous) offset that has been replicated
-\* to the leader's maximal ISR.
+\* to the leader's maximal ISR - nominally called the commit offset here.
 
 IsCommitted(b, maximal_isr, replica_state, offset) ==
     \A b1 \in maximal_isr :
-        /\ replica_state[b1].leo # Nil
-        /\ replica_state[b1].leo > offset
+        \/ b = b1 \* we auto-count the leader itself
+        \/ /\ replica_state[b1].leo # Nil
+           /\ replica_state[b1].leo > offset
 
-HighestCommitted(b, maximal_isr, replica_state) ==
+GetCommitOffset(b, maximal_isr, leo, replica_state) ==
     CASE LeoOf(b) = 1 ->
             0
-      [] \E offset \in 1..LeoOf(b)-1:
+      [] \E offset \in 1..leo-1:
             IsCommitted(b, maximal_isr, replica_state, offset) ->
                 \* This is a TLA+ way of saying choose the highest offset which is committed.
                 \* Basically, choose an offset such that it is committed and no other offset
                 \* exists that is also committed and is higher.
-                CHOOSE offset \in 1..LeoOf(b)-1 :
+                CHOOSE offset \in 1..leo-1 :
                     /\ IsCommitted(b, maximal_isr, replica_state, offset)
-                    /\ ~\E offset1 \in 1..LeoOf(b)-1 :
+                    /\ ~\E offset1 \in 1..leo-1 :
                         /\ IsCommitted(b, maximal_isr, replica_state, offset1)
                         /\ offset1 > offset
       [] OTHER -> 0
+
+\* Only the replica state of one follower may have changed from current state
+CommitOffsetOnFetch(b, replica_state) ==
+    GetCommitOffset(b, PartitionMetadata(b).maximal_isr, 
+                    LeoOf(b), replica_state)
+
+\* Only the maximal ISR may have changed from current state
+CommitOffsetOnUpdate(b, maximal_isr) ==
+    GetCommitOffset(b, maximal_isr, LeoOf(b), 
+                    partition_replica_state[b])
+
+\* Only the leader's log may have changed from current state    
+CommitOffsetOnWrite(b, new_leo) ==
+    GetCommitOffset(b, partition_metadata[b].maximal_isr,
+                    new_leo, partition_replica_state[b])
 
 \*-------------------------------------------------------------
 \* FUNCTION: MaybeAdvanceHighWatermark
@@ -156,27 +175,31 @@ SendAcksFor(b, lower, higher, ack_type) ==
                                      /\ v \notin inv_neg_acked
                                      /\ \E offset \in lower..higher :
                                           LogEntry(b, offset).value = v }
-    IN IF ack_type = TRUE 
+    IN 
+       IF ack_type = TRUE 
        THEN /\ inv_pos_acked' = inv_pos_acked \union values
-            /\ UNCHANGED << inv_neg_acked, inv_sent >>
+            /\ UNCHANGED << inv_neg_acked >>
        ELSE /\ inv_neg_acked' = inv_neg_acked \union values
-            /\ UNCHANGED << inv_pos_acked, inv_sent >> 
+            /\ UNCHANGED << inv_pos_acked >> 
+
+UpdateHwmInvariantVars(b, old_hwm, new_hwm, ack_type) ==
+    /\ IF ack_type = TRUE  \* positive ack
+       THEN SendAcksFor(b, old_hwm, new_hwm-1, ack_type) \* pos ack up to new HWM
+       ELSE SendAcksFor(b, old_hwm, LeoOf(b)-1, ack_type) \* neg ack from old HWM and above
+    \* update the true high watermark
+    /\ inv_true_hwm' = IF new_hwm > inv_true_hwm
+                       THEN new_hwm ELSE inv_true_hwm
+    \* If the "real" HWM has advanced, record which records
+    \* got consumed by consumers.
+    /\ inv_consumed' = IF new_hwm > inv_true_hwm
+                       THEN inv_consumed \o SubSeq(LogOf(b), inv_true_hwm, new_hwm-1)
+                       ELSE inv_consumed
                     
 MaybeAdvanceHighWatermark(b, old_hwm, new_hwm, ack_type) ==
     IF new_hwm > old_hwm
     THEN /\ partition_data' = [partition_data EXCEPT ![b].hwm = new_hwm]
-         \* record which values got acked (positively or negatively) to producers
-         /\ IF ack_type = TRUE  \* positive ack
-            THEN SendAcksFor(b, old_hwm, new_hwm-1, ack_type) \* pos ack up to new HWM
-            ELSE SendAcksFor(b, old_hwm, LeoOf(b)-1, ack_type) \* neg ack from old HWM and above
-         \* update the true high watermark
-         /\ inv_true_hwm' = IF new_hwm > inv_true_hwm
-                            THEN new_hwm ELSE inv_true_hwm
-         \* If the "real" HWM has advanced, record which records
-         \* got consumed by consumers.
-         /\ inv_consumed' = IF new_hwm > inv_true_hwm
-                            THEN inv_consumed \o SubSeq(LogOf(b), inv_true_hwm, new_hwm-1)
-                            ELSE inv_consumed
+         /\ UpdateHwmInvariantVars(b, old_hwm, new_hwm, ack_type)
+         /\ UNCHANGED inv_sent
     ELSE NoHighWatermarkChange
 
 \*-----------------------------------------------------------
@@ -217,10 +240,9 @@ MaybeFailPendingWrites(b, part_state) ==
 \* still not have enough information on its followers to know to 
 \* compute the new high watermark.
 
-MaybeUpdateHwmOnPartitionChange(b, part_state) ==
+MaybeUpdateHwmOnPartitionChange(b, part_state, is_new_leader) ==
     LET old_hwm == HwmOf(b)
-        new_hwm == HighestCommitted(b, part_state.maximal_isr,
-                                    partition_replica_state[b]) + 1
+        new_hwm == CommitOffsetOnUpdate(b, part_state.maximal_isr) + 1
         ack_type == IF Cardinality(part_state.maximal_isr) >= MinISR
                     THEN TRUE ELSE FALSE
     IN MaybeAdvanceHighWatermark(b, old_hwm, new_hwm, ack_type)

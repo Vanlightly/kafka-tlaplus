@@ -1,6 +1,6 @@
 -------------------------- MODULE kafka_replication_v3_5_simple --------------------------
 
-EXTENDS Naturals, FiniteSets, FiniteSetsExt, Sequences, SequencesExt, TLC, TLCExt,
+EXTENDS Naturals, FiniteSets, FiniteSetsExt, Sequences, SequencesExt, TLC, 
         message_passing, 
         v3_5_types,
         v3_5_properties,
@@ -131,7 +131,7 @@ BrokerStart ==
         /\ partition_status' = [partition_status EXCEPT ![b] = Nil]
         /\ SendBrokerRegistration(b)
         /\ UNCHANGED << con_vars, broker_fetchers, broker_metadata_log, 
-                        partition_metadata, partition_data,
+                        partition_metadata, partition_data, partition_leso,
                         partition_replica_state, partition_pending_ap, 
                         inv_vars, aux_broker_epoch >>        
 
@@ -234,7 +234,7 @@ ReceiveBrokerRegResponse ==
         /\ __CatchUpBarOne(m.dest, m)
         /\ Discard(m)
         /\ UNCHANGED << con_vars, broker_fetchers, partition_status, partition_data,  
-                        partition_replica_state, partition_pending_ap, 
+                        partition_leso, partition_replica_state, partition_pending_ap, 
                         inv_vars, aux_vars >>
 
 (*--------------------------------------------------------------------
@@ -296,27 +296,29 @@ FenceBroker ==
   In this simplified spec, only PartitionChange records are added to the 
   metadata log and brokers receive metadata records one at a time. When a 
   broker receives a PartionChange metadata record it can take various 
-  actions:
-   - It may have become the partition leader in a new leader epoch:
-        - records the start offset for this leader epoch (the LEO on 
+  actions. There are 5 sub-actions:
+   1. RemainLeader
+        - it may need to advance the HWM as the ISR changed.
+   2. BecomeLeaderInNewEpoch
+        - Records the start offset for this leader epoch (the LEO on 
           becoming leader).
         - If it is a follower->leader change then remove the partition
           from any fetcher it is added to.
-   - It may have retained leadership in the same leader epoch and the 
-     metadata change relates to the ISR only:
-        - it may need to advance the HWM.
-   - It may have remained a follower in the same leader epoch:
-        - do nothing
-   - It may have become a follower in a new leader epoch:
+   3. RemainFollower
+        - No actions
+   4. BecomeFollowerInNewEpoch
         - Adds the partition to the right fetcher and removes the partition
-          from any other fetcher if it exists. 
+          from any other fetcher if it exists.
         - The follower does not perform truncation, this spec implements
           the diverging epoch on fetch.
-   - There may be no leader, so it simply waits for the next PartionChangeRecord.
-   - Uncommitted pending writes may need to be negatively acknowledged:
-       - if the replica has lost leadership
-       - the ISR has shrunk below minISR.
------------------------------------------------------------------------*)           
+        - Negatively acknowledge pending requests if:
+            - the replica has lost leadership.
+            - the ISR has shrunk below minISR.
+   5. WaitForLeaderChange
+        - Negatively acknowledge pending requests if:
+            - the replica has lost leadership.
+            - the ISR has shrunk below minISR.
+ -----------------------------------------------------------------------*)           
 
 \* Add the partition to the fetcher in the case that:
 \*    - this is a new leader epoch.
@@ -325,7 +327,8 @@ FenceBroker ==
 \* if it existed on another. The Last Fetch Epoch is set to the
 \* epoch of the last record in the log.
 AddPartitionToFetcher(b, leader, leader_epoch) ==
-    IF \/ leader_epoch > PartitionMetadata(b).leader_epoch
+    IF 
+       \/ leader_epoch > PartitionMetadata(b).leader_epoch \* CHECK
        \/ ~IsPartitionAdded(b, leader)
     THEN LET add_partition == [fetch_offset       |-> LeoOf(b),
                                last_fetched_epoch |-> IF LogOf(b) = <<>> 
@@ -352,55 +355,89 @@ RemovePartitionFromFetchers(b) ==
 NoFetcherChanges ==
     UNCHANGED broker_fetchers
 
-NextMetadataRecord(index) ==
-    con_metadata_log[index]
+IsLeaderEpochBump(b, md_offset) ==
+    con_metadata_log[md_offset].leader_epoch > PartitionMetadata(b).leader_epoch
+
+\* As leader we care about every partition change but as follower
+\* we only care about leader epoch changes (as a state space reduction).
+ExistMetadataUpdates(b) ==
+    /\ Len(broker_metadata_log[b]) < Len(con_metadata_log)
+    /\ IF partition_status[b] = Leader
+       THEN TRUE
+       ELSE \E md_offset \in Len(broker_metadata_log[b])+1..Len(con_metadata_log) :
+                IsLeaderEpochBump(b, md_offset)
+       
+
+\* As leader we care about every partition change but as follower
+\* we only care about leader epoch changes (as a state space reduction)
+\* so we skip any records that are ISR only changes.
+RECURSIVE NextMetadataRecord(_,_)
+NextMetadataRecord(b, md_offset) ==
+    IF \/ partition_status[b] = Leader 
+       \/ IsLeaderEpochBump(b, md_offset)
+    THEN [record |-> con_metadata_log[md_offset],
+          offset |-> md_offset]
+    ELSE NextMetadataRecord(b, md_offset + 1)
     
 \* Ensure all state related to former leadership is clear    
 EnsureLeadershipRenounced(b, new_part_md) ==
     /\ MaybeFailPendingWrites(b, new_part_md)
-    /\ ResetReplicaState(b, FALSE)
+    /\ ResetReplicaState(b)
     /\ ResetPendingAlterPartition(b)    
-    
+
+\* --- Sub-Action 1: RemainLeader ---
 \* The replica remains leader, all it must do is conditionally advance the HWM.
 RemainLeader(b, new_part_md) ==
-    /\ MaybeUpdateHwmOnPartitionChange(b, new_part_md)
+    /\ MaybeUpdateHwmOnPartitionChange(b, new_part_md, FALSE)
     /\ IF new_part_md.partition_epoch >= partition_pending_ap[b].epoch
        THEN ResetPendingAlterPartition(b)
        ELSE UNCHANGED partition_pending_ap
-    /\ UNCHANGED << partition_status, partition_replica_state, broker_fetchers>>
+    /\ UNCHANGED << partition_status, partition_replica_state, 
+                    partition_leso, broker_fetchers>>
 
+\* --- Sub-Action 2: BecomeLeaderInNewEpoch ---
 \* The replica has become a leader in a new leader epoch. This includes
 \* a leader being reelected in a new leader epoch. So it must set its
-\* Epoch Start Offset, reset any peer replica state and remove the
-\* partition from any fetcher if it is added.   
-BecomeLeaderInNewEpoch(b) ==
+\* Leader Epoch Start Offset, reset any peer replica state and remove the
+\* partition from any fetcher if it is added.
+\* It may also now be able to advance the high watermark if the ISR consists
+\* only of itself. It doesn't yet know the LEO of the followers so HWM would
+\* only advance if the ISR were only this leader.
+BecomeLeaderInNewEpoch(b, new_part_md, is_new_leader) ==
     /\ partition_status' = [partition_status EXCEPT ![b] = Leader]
-    /\ partition_data' = [partition_data EXCEPT ![b].epoch_start_offset = LeoOf(b)]
-    /\ ResetReplicaState(b, TRUE)
+    /\ MaybeUpdateHwmOnPartitionChange(b, new_part_md, TRUE)
+    /\ partition_leso' = [partition_leso EXCEPT ![b] = LeoOf(b)]
+    /\ IF is_new_leader
+       THEN ResetReplicaState(b)
+       ELSE UNCHANGED partition_replica_state
     /\ ResetPendingAlterPartition(b)
     /\ RemovePartitionFromFetchers(b)
-    /\ UNCHANGED << inv_vars >>
 
+\* --- Sub-Action 3: RemainFollower ---
 \* The replica is still a follower in the same leader epoch. So do nothing.     
 RemainFollower ==
     UNCHANGED << partition_status, partition_data, partition_replica_state, 
-                 partition_pending_ap, broker_fetchers, inv_vars >>
+                 partition_leso, partition_pending_ap, broker_fetchers, inv_vars >>
 
+\* --- Sub-Action 4: BecomeFollowerInNewEpoch ---
 \* The replica has become a follower and adds the partition to the right fetcher
 \* setting its fetch offset to its current LEO. If log truncation is required,
 \* it will occur on its first fetch response.        
 BecomeFollowerInNewEpoch(b, new_part_md) ==
     /\ partition_status' = [partition_status EXCEPT ![b] = Follower]
     /\ AddPartitionToFetcher(b, new_part_md.leader, new_part_md.leader_epoch)
+    /\ partition_leso' = [partition_leso EXCEPT ![b] = Nil]
     \* in case it was formerly a leader
     /\ EnsureLeadershipRenounced(b, new_part_md)
     /\ UNCHANGED << partition_data, inv_true_hwm, inv_consumed >>
-    
+
+\* --- Sub-Action 5: WaitForLeaderChange ---    
 \* The replica learns there is no leader, so waits in limbo until
 \* it gets new information.    
 WaitForLeaderChange(b, new_part_md) ==
     /\ partition_status' = [partition_status EXCEPT ![b] = Nil]
     /\ RemovePartitionFromFetchers(b)
+    /\ partition_leso' = [partition_leso EXCEPT ![b] = Nil]
     \* in case it was formerly a leader
     /\ EnsureLeadershipRenounced(b, new_part_md)
     /\ UNCHANGED << partition_data, inv_true_hwm, inv_consumed >>
@@ -411,20 +448,23 @@ MetadataNoOp ==
 ReceiveMetadataUpdate ==
     \E b \in Brokers :
         LET curr_md_offset == Len(broker_metadata_log[b])
-            pc_record      == NextMetadataRecord(curr_md_offset + 1)
+            metadata       == NextMetadataRecord(b, curr_md_offset + 1)
+            append_records == SubSeq(con_metadata_log, curr_md_offset + 1, metadata.offset) 
             curr_part_md   == PartitionMetadata(b)
-            new_part_md    == [isr             |-> pc_record.isr,
-                               maximal_isr     |-> pc_record.isr,
-                               leader          |-> pc_record.leader,
-                               leader_epoch    |-> pc_record.leader_epoch,
-                               partition_epoch |-> pc_record.partition_epoch]
+            new_part_md    == [isr             |-> metadata.record.isr,
+                               maximal_isr     |-> metadata.record.isr,
+                               leader          |-> metadata.record.leader,
+                               leader_epoch    |-> metadata.record.leader_epoch,
+                               partition_epoch |-> metadata.record.partition_epoch]
+            is_new_leader  == /\ partition_status[b] # Leader
+                              /\ metadata.record.leader = b                              
         IN
             \* enabling conditions
+            /\ ExistMetadataUpdates(b)
             /\ broker_state[b].status \notin {OFFLINE_CLEAN, OFFLINE_DIRTY}
             /\ broker_state[b].registered = TRUE
-            /\ curr_md_offset < Len(con_metadata_log) \* there are metadata records to receive
             \* state mutations
-            /\ broker_metadata_log' = [broker_metadata_log EXCEPT ![b] = Append(@, pc_record)]
+            /\ broker_metadata_log' = [broker_metadata_log EXCEPT ![b] = @ \o append_records]
                \* If the last PartitionChangeRecord has a higher partition epoch, then update 
                \* the local partition state and possibly become a leader or follower.
                \* The partition epoch will not be lower if the change is the result of a completed
@@ -435,18 +475,18 @@ ReceiveMetadataUpdate ==
                     /\ CASE 
                          \* CASE --- Remains leader --------------------------------
                             /\ PartitionMetadata(b).leader = b
-                            /\ pc_record.leader = b -> 
+                            /\ metadata.record.leader = b -> 
                                 IF PartitionMetadata(b).leader_epoch = new_part_md.leader_epoch
                                 THEN \* Remains leader in the same leader epoch
                                      RemainLeader(b, new_part_md)
                                 ELSE \* Leader reelected in a new leader epoch
-                                     BecomeLeaderInNewEpoch(b)
+                                     BecomeLeaderInNewEpoch(b, new_part_md, is_new_leader)
                          \* CASE --- Follower elected as leader----------------------
                          [] /\ PartitionMetadata(b).leader # b
-                            /\ pc_record.leader = b ->
-                                BecomeLeaderInNewEpoch(b)
+                            /\ metadata.record.leader = b ->
+                                BecomeLeaderInNewEpoch(b, new_part_md, is_new_leader)
                          \* CASE --- Chosen as a follower ---------------------------
-                         [] /\ pc_record.leader # NoLeader ->
+                         [] /\ metadata.record.leader # NoLeader ->
                                 IF /\ new_part_md.leader_epoch = curr_part_md.leader_epoch
                                    /\ curr_part_md.leader # b
                                    /\ new_part_md.leader # b
@@ -457,7 +497,7 @@ ReceiveMetadataUpdate ==
                                 WaitForLeaderChange(b, new_part_md)
                          \* END CASE
                ELSE MetadataNoOp
-            /\ UNCHANGED << con_vars, broker_state, messages, aux_vars >>
+            /\ UNCHANGED << con_vars, broker_state, messages, aux_vars, inv_sent >>
 
 (*--------------------------------------------------------------------------
   ACTION: SendAlterPartitionRequest
@@ -468,7 +508,7 @@ ReceiveMetadataUpdate ==
   them to the proposed ISR. The definition of "caught up" is that:
     a. The replica has not timed out.
     b. The replica fetch offset is >= HWM.
-    c. The replica fetch offset is >= Start Epoch Offset.
+    c. The replica fetch offset is >= Leader Epoch Start Offset.
   
   We simulate timed out followers without actually tracking fetch
   requests. Instead we simply allow a non-deterministic subset of
@@ -512,8 +552,8 @@ FollowerIsCaughtUp(b, follower, follower_leo, timed_out_followers) ==
     /\ follower_leo # Nil
     \* The follower must have reached the high watermark
     /\ follower_leo >= HwmOf(b)
-    \* The follower must have reached the epoch start offset
-    /\ follower_leo >= PartitionData(b).epoch_start_offset
+    \* The follower must have reached the Leader Epoch Start Offset
+    /\ follower_leo >= partition_leso[b] 
     \* The follower cannot have timed out
     /\ follower \notin timed_out_followers
 
@@ -550,8 +590,9 @@ SendAlterPartitionRequest ==
                                                     [epoch   |-> PartitionMetadata(b).partition_epoch + 1,
                                                      request |-> ap_request]]
                   /\ aux_ctrs' = [aux_ctrs EXCEPT !.alter_part_ctr = @ + 1]
-                  /\ UNCHANGED << con_vars, broker_vars, partition_data, partition_replica_state, 
-                                  partition_status, inv_vars, aux_broker_epoch >>
+                  /\ UNCHANGED << con_vars, broker_vars, partition_data, partition_leso, 
+                                  partition_replica_state, partition_status, inv_vars,
+                                  aux_broker_epoch >>
 
 (*--------------------------------------------------------------------------
   ACTION: ReceiveAlterPartitionRequest
@@ -576,7 +617,7 @@ SendAlterPartitionRequest ==
 
 IsEligibleBroker(b, broker_epoch) ==
     /\ con_broker_reg[b].status = UNFENCED
-    /\ \/ broker_epoch = 0
+    /\ \/ broker_epoch = 0                                  \* CHECK FAIL
        \/ con_broker_reg[b].broker_epoch = broker_epoch
     
 EligibleIsr(m) ==
@@ -585,9 +626,9 @@ EligibleIsr(m) ==
 
 ValidateRequest(b, m) ==
     IF /\ b = con_partition_metadata.leader
-       /\ m.broker_epoch = con_broker_reg[b].broker_epoch
-       /\ m.partition_epoch = con_partition_metadata.partition_epoch
-       /\ m.leader_epoch = con_partition_metadata.leader_epoch
+       /\ m.broker_epoch = con_broker_reg[b].broker_epoch               \* CHECK OK?
+       /\ m.partition_epoch = con_partition_metadata.partition_epoch    \* CHECK FAIL
+       /\ m.leader_epoch = con_partition_metadata.leader_epoch          \* CHECK OK
     THEN IF EligibleIsr(m)
          THEN Nil
          ELSE IneligibleReplica
@@ -645,7 +686,7 @@ ReceiveAlterPartitionRequest ==
 
   A broker receives an AlterPartition response. 
 
-  If the response is ignored in the following cases:
+  The response is ignored in the following cases:
     - The response does not match the requested change
     - Has a Nil error code but the partition epoch is not higher.
       This happens when a metadata update for this change was
@@ -660,7 +701,7 @@ ReceiveAlterPartitionRequest ==
 
 CommitPartitionChange(b, part_state) ==
     /\ partition_metadata' = [partition_metadata EXCEPT ![b] = part_state]
-    /\ MaybeUpdateHwmOnPartitionChange(b, part_state)
+    /\ MaybeUpdateHwmOnPartitionChange(b, part_state, FALSE)
 
 CompletePartitionChange(b, m) ==
     CommitPartitionChange(b, [isr             |-> m.isr,
@@ -693,7 +734,7 @@ ReceiveAlterPartitionResponse ==
                  ELSE RollbackPartitionChange(b)
               /\ ResetPendingAlterPartition(b)
               /\ Discard(m)
-        /\ UNCHANGED << con_vars, broker_vars, partition_status, 
+        /\ UNCHANGED << con_vars, broker_vars, partition_status, partition_leso,
                         partition_replica_state, aux_vars >>
 
 (*-----------------------------------------------------------------------
@@ -718,7 +759,7 @@ SendFetchRequest ==
         /\ Fetcher(from, to).pending_response = FALSE  \* The fetcher is not waiting for a response
         /\ PartitionMetadata(from).leader = to         \* This replica believes the destination 
                                                        \* broker hosts the leader replica
-        /\ __FetchMakesProgress(from) \* prevents infinite cycles
+        /\ __SendFetchMakesProgress(from) \* prevents infinite cycles
         \* state mutations
         /\ Send([type               |-> FetchRequest,
                  broker_epoch       |-> broker_state[from].broker_epoch,
@@ -756,6 +797,7 @@ ReceiveFetchRequest ==
     \E m \in DOMAIN messages :
         \* enabling conditions
         /\ ReceivableMsg(m, FetchRequest)
+        /\ __ReceiveFetchMakesProgress(m)
         /\ LET b          == m.dest
                last_epoch == LastOffsetForEpoch(b, m.partition.last_fetched_epoch, TRUE)
            IN
@@ -763,7 +805,7 @@ ReceiveFetchRequest ==
               \* state mutations
               /\ CASE \* --- CASE stale leader/not leader/fenced leader epoch ---------------
                       \/ partition_status[b] # Leader
-                      \/ PartitionMetadata(b).leader_epoch # m.partition.leader_epoch ->
+                      \/ PartitionMetadata(b).leader_epoch # m.partition.leader_epoch ->  \* CHECK OK
                           \* In the case of being a stale leader, don't do any state changes,
                           \* wait for the metadata update to bring this stale leader up to date.        
                           /\ Reply(m,
@@ -803,8 +845,7 @@ ReceiveFetchRequest ==
                                                         [leo              |-> m.partition.fetch_offset,
                                                          broker_epoch     |-> m.broker_epoch]]
                               old_hwm == HwmOf(b)
-                              new_hwm == HighestCommitted(b, PartitionMetadata(b).maximal_isr, 
-                                                          updated_rep_state) + 1
+                              new_hwm == CommitOffsetOnFetch(b, updated_rep_state) + 1
                           IN
                               /\ MaybeAdvanceHighWatermark(b, old_hwm, new_hwm, TRUE)
                               /\ partition_replica_state' = [partition_replica_state EXCEPT ![b] = updated_rep_state]
@@ -825,7 +866,8 @@ ReceiveFetchRequest ==
                                          source           |-> m.dest])
                     \* CASE END ------------------------------------------
               /\ UNCHANGED << con_vars, broker_state, broker_fetchers, broker_metadata_log,
-                              partition_metadata, partition_status, partition_pending_ap, aux_vars >>        
+                              partition_metadata, partition_status, partition_leso,
+                              partition_pending_ap, aux_vars >>        
 
 (*-------------------------------------------------------------------
   ACTION: ReceiveFetchResponse
@@ -864,9 +906,8 @@ TruncateToSafePoint(b, diverging_epoch) ==
     IN IF truncate_to > 1
        THEN [log                |-> [offset \in 1..truncate_to-1 |-> LogEntry(b, offset)],
              leo                |-> truncate_to,
-             hwm                |-> HwmOf(b), \* truncating does not affect the hwm
-             epoch_start_offset |-> Nil] 
-       ELSE [log |-> <<>>, hwm |-> HwmOf(b), leo |-> 1, epoch_start_offset |-> Nil]
+             hwm                |-> HwmOf(b)] \* Truncation does not affect HWM
+       ELSE [log |-> <<>>, hwm |-> HwmOf(b), leo |-> 1]
 
 IsFollowerOf(b, leader) ==
     /\ partition_status[b] = Follower
@@ -924,12 +965,12 @@ ReceiveFetchResponse ==
                           IN
                               /\ LeoOf(b) = m.partition.fetch_offset \* double check the fetch offset matches the LEO
                               \* state mutations
-                              /\ partition_data' = [partition_data EXCEPT 
-                                                        ![b].log = LogOf(b) \o m.partition.records, \* append the new data
-                                                        ![b].leo = new_leo,
-                                                        \* just overwrite HWM as long as it falls within bounds of the log
-                                                        ![b].hwm = IF m.partition.hwm <= new_leo
-                                                                   THEN m.partition.hwm ELSE HwmOf(b)] 
+                              /\ partition_data' = [partition_data EXCEPT ![b] =
+                                                        [log |-> LogOf(b) \o m.partition.records, \* append the new data
+                                                         leo |-> new_leo,
+                                                         \* just overwrite HWM as long as it falls within bounds of the log
+                                                         hwm |-> IF m.partition.hwm <= new_leo
+                                                                 THEN m.partition.hwm ELSE HwmOf(b)]]
                               /\ broker_fetchers' = [broker_fetchers EXCEPT ![b][m.source] =  
                                                             [partition |-> [fetch_offset       |-> new_leo,
                                                                             last_fetched_epoch |-> last_fetched_epoch,
@@ -939,13 +980,17 @@ ReceiveFetchResponse ==
                   \* CASE END -----------------------------------------
               /\ Discard(m)
               /\ UNCHANGED << con_vars, broker_state, broker_metadata_log, partition_metadata, 
-                              partition_replica_state, partition_pending_ap, inv_vars, aux_vars >> 
+                              partition_replica_state, partition_leso, partition_pending_ap,
+                              inv_vars, aux_vars >> 
 
 (*--------------------------------------------------------------
   ACTION: WriteRecordToLeader
 
   A leader receives a produce request if the maximal ISR 
   size >= minISR, it writes the value to its local partition log.
+  
+  If the MinISR = 1 and the ISR is only the leader then it is 
+  possible for the high watermark to be incremented too.
 ---------------------------------------------------------------------*)  
 
 WriteRecordToLeader ==
@@ -961,15 +1006,20 @@ WriteRecordToLeader ==
                               offset |-> LeoOf(b),
                               value  |-> v]
                new_log    == Append(LogOf(b), new_record)
-           IN
+               old_hwm    == HwmOf(b)
+               new_hwm    == CommitOffsetOnWrite(b, new_leo) + 1
+          IN
               /\ partition_data' = [partition_data EXCEPT ![b] =
-                                         [partition_data[b] EXCEPT !.leo = new_leo,
-                                                                   !.log = new_log]]
-              /\ partition_replica_state' = [partition_replica_state EXCEPT ![b][b].leo = new_leo]
+                                            [leo |-> new_leo,
+                                             hwm |-> IF new_hwm > old_hwm 
+                                                     THEN new_hwm ELSE old_hwm,
+                                             log |-> new_log]]
+              /\ IF new_hwm > old_hwm
+                 THEN UpdateHwmInvariantVars(b, old_hwm, new_hwm, TRUE)
+                 ELSE UNCHANGED << inv_pos_acked, inv_neg_acked, inv_true_hwm, inv_consumed >>
               /\ inv_sent' = inv_sent \union {v}
-              /\ UNCHANGED << con_vars, broker_vars, partition_metadata, partition_status, 
-                              partition_pending_ap, messages, aux_vars, inv_true_hwm, 
-                              inv_consumed, inv_pos_acked, inv_neg_acked >>
+              /\ UNCHANGED << con_vars, broker_vars, partition_metadata, partition_status, partition_leso,
+                              partition_replica_state, partition_pending_ap, messages, aux_vars >>
 
 (*-----------------------------------------------------------------------
   ACTION: UncleanShutdown
@@ -1014,13 +1064,18 @@ FailPendingWritesIfLeader(b) ==
     IF /\ partition_status[b] = Leader 
        /\ HwmOf(b) < LeoOf(b)
     THEN FailPendingWrites(b)
-    ELSE UNCHANGED << inv_sent, inv_pos_acked, inv_neg_acked >>
+    ELSE UNCHANGED << inv_pos_acked, inv_neg_acked >>
 
 UncleanShutdown ==
     \* enabling conditions
     /\ aux_ctrs.unclean_shutdown_ctr < UncleanShutdownLimit
     /\ \E b \in Brokers :
         /\ broker_state[b].status \notin { OFFLINE_CLEAN, OFFLINE_DIRTY }
+        /\ IF AvoidLastReplicaStanding = TRUE
+           THEN \/ con_partition_metadata.leader # b
+                \/ Cardinality(con_partition_metadata.isr) > 1
+           ELSE TRUE
+        /\ aux_ctrs.fence_broker_ctr = 0
         \* state mutations
         /\ broker_state' = [broker_state EXCEPT ![b] = 
                                 [status            |-> OFFLINE_DIRTY,
@@ -1030,8 +1085,8 @@ UncleanShutdown ==
         /\ DropFetchSessions(b)
         /\ partition_status' = [partition_status EXCEPT ![b] = Nil]
         /\ partition_data' = [partition_data EXCEPT ![b] = 
-                                        [log |-> <<>>, hwm |-> 1, leo |-> 1,
-                                         epoch_start_offset |-> 0]]
+                                        [log |-> <<>>, hwm |-> 1, leo |-> 1]]
+        /\ partition_leso' = [partition_leso EXCEPT ![b] = Nil]
         /\ partition_replica_state' = [partition_replica_state EXCEPT ![b] = 
                                         [b1 \in Brokers |-> BlankReplicaState]]
         /\ ResetPendingAlterPartition(b)
@@ -1041,7 +1096,7 @@ UncleanShutdown ==
         /\ HandleBrokerFenced(b)
         /\ con_broker_reg' = [con_broker_reg EXCEPT ![b].status = FENCED]
         /\ UNCHANGED << partition_metadata, broker_metadata_log, inv_true_hwm,
-                        inv_consumed, aux_broker_epoch >>
+                        inv_consumed, inv_sent, aux_broker_epoch >>
                         
 (*-----------------------------------------------------------------------
   ACTION: CleanShutdown
@@ -1074,8 +1129,9 @@ CleanShutdown ==
         \* make the controller detect it
         /\ HandleBrokerFenced(b)
         /\ con_broker_reg' = [con_broker_reg EXCEPT ![b].status = FENCED]
-        /\ UNCHANGED << partition_metadata, partition_data, broker_metadata_log, 
-                        inv_true_hwm, inv_consumed, aux_broker_epoch >>
+        /\ UNCHANGED << partition_metadata, partition_data, partition_leso,
+                        broker_metadata_log, inv_sent, inv_true_hwm, inv_consumed, 
+                        aux_broker_epoch >>
 
 \* ==================================================================
 \*              INIT and NEXT
@@ -1085,6 +1141,7 @@ CleanShutdown ==
 \* When InitIsrSize < ReplicationFactor then a subset of broker start outside 
 \* of the ISR with a stale partiion_epoch. This allows us to explore
 \* more state space.
+\* REMEMBER: offsets are 1-based because TLA+ is 1-based!
 
 Init ==
     LET init_isr   == CHOOSE isr \in SUBSET Brokers :
@@ -1149,8 +1206,8 @@ Init ==
         /\ partition_data = [b \in Brokers |->
                                     [log                |-> <<>>,
                                      hwm                |-> 1,
-                                     leo                |-> 1,
-                                     epoch_start_offset |-> 0]]
+                                     leo                |-> 1]]
+        /\ partition_leso = [b \in Brokers |-> IF b = 1 THEN 1 ELSE Nil]                                     
         /\ partition_replica_state = [b \in Brokers |->
                                         [b1 \in Brokers |-> BlankReplicaState]]
         /\ partition_pending_ap = [b \in Brokers |-> [epoch |-> 0, request |-> Nil]]
@@ -1189,17 +1246,18 @@ Next ==
 \* We only need actions that help the cluster make progress and
 \* recover from failures here.
 Liveness ==
-    /\ WF_vars(BrokerStart)
-    /\ WF_vars(ReceiveBrokerRegResponse)
-    /\ WF_vars(ReceiveMetadataUpdate)
-    /\ WF_vars(ReceiveAlterPartitionResponse)
-    /\ WF_vars(SendFetchRequest)
-    /\ WF_vars(ReceiveFetchRequest)
-    /\ WF_vars(ReceiveFetchResponse)
-    /\ WF_vars(WriteRecordToLeader)
-    /\ WF_vars(ReceiveBrokerRegRequest)
-    /\ WF_vars(ReceiveAlterPartitionRequest)
-    /\ WF_vars(UnfenceBroker)
+    WF_vars(\/ BrokerStart
+            \/ ReceiveBrokerRegResponse
+            \/ ReceiveMetadataUpdate
+            \/ SendAlterPartitionRequest
+            \/ ReceiveAlterPartitionResponse
+            \/ SendFetchRequest
+            \/ ReceiveFetchRequest
+            \/ ReceiveFetchResponse
+            \/ WriteRecordToLeader
+            \/ ReceiveBrokerRegRequest
+            \/ ReceiveAlterPartitionRequest
+            \/ UnfenceBroker) 
     
 Spec == Init /\ [][Next]_vars
 LivenessSpec == Init /\ [][Next]_vars /\ Liveness    
