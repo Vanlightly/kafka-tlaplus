@@ -78,23 +78,22 @@ ValidControllerState ==
            /\ b \notin con_unfenced
     \* A fenced broker cannot be in an ISR of size > 1
     /\ IF Cardinality(con_partition_metadata.isr) > 1
-       THEN ~\E b \in Brokers :
+       THEN ~\E b \in con_partition_metadata.replicas :
                /\ con_broker_reg[b].status = FENCED
                /\ b \in con_partition_metadata.isr
        ELSE TRUE
     \* The ISR cannot be empty
     /\ con_partition_metadata.isr # {} 
     
-\* INV: ValidLeaderMaximalISR
+\* INV: ReplicationQuorumSupersetProperty
 \* The maximal ISR is critical for safety. The invariant here is that
 \* the maximal ISR on the (non-stale) leader must be a superset of
-\* the controller ISR. Else we can lose data.
-\* (Triggers soon than invariant LeaderHasCompleteCommittedLog). 
+\* the controller ISR. Else we can lose data. 
 IsNonStaleLeader(b) ==
     /\ partition_status[b] = Leader
     /\ partition_metadata[b].leader_epoch = con_partition_metadata.leader_epoch
 
-ValidLeaderMaximalISR ==
+ReplicationQuorumSupersetProperty ==
     \A b \in Brokers :
         \* if the leader is a non-stale leader
         IF IsNonStaleLeader(b)
@@ -108,33 +107,55 @@ ValidLeaderMaximalISR ==
                     b1 \in partition_metadata[b].maximal_isr
         ELSE TRUE
 
-\* INV: ControllerIsrHasUpToTrueHWM
+\* INV: LeaderCandidateCompletenessProperty
 \* The true HWM is tracked by the spec (not the brokers)
-\* and if any replica in the ISR has an LEO < the true
-\* HWM, then that is an illegal state which can lead
-\* to data loss. 
-\* (Triggers soon than invariant LeaderHasCompleteCommittedLog).
-ControllerIsrHasUpToTrueHWM ==
-    \* No member of the ISR is missing committed records
-    \* and is RUNNING 
-    /\ ~\E b \in con_partition_metadata.isr :
-        /\ partition_data[b].leo < inv_true_hwm
-        /\ broker_state[b].status = RUNNING
+\* and if any replica in the ISR has an LEO < the True
+\* HWM, then that violates this property. Note that
+\* this only applies for ISR members that are running. If a replica
+\* just experienced a lossy unclean shutdown then it might not
+\* host all committed data - but the Unclean Exclusion property
+\* guarantees that once it is running again, it cannot be in the ISR
+\* until it has proven itself by catching up to the new leader.
+LeaderCandidateCompletenessProperty ==
+    \* if something got committed then do the check
+    IF inv_true_hwm > 1
+    THEN 
+         \* If there is a running leader then it should host the committed data
+        ~\E b \in con_partition_metadata.isr :
+            /\ partition_data[b].leo < inv_true_hwm
+            /\ broker_state[b].status = RUNNING
+    ELSE TRUE
 
-\* INV: LeaderHasCompleteCommittedLog
+\* INV: LeaderCompletenessProperty
 \* The replica selected as leader by the controller must have
-\* the entire acknowledged log else this is data loss.
-LeaderHasCompleteCommittedLog ==
-    \/ con_partition_metadata.leader = NoLeader
-    \/ /\ con_partition_metadata.leader # NoLeader
-       /\ \A v \in inv_pos_acked :
-            \E offset \in DOMAIN partition_data[con_partition_metadata.leader].log :
-                partition_data[con_partition_metadata.leader].log[offset].value = v
+\* the entire committed log else this is data loss. Again,
+\* this only applies if the leader is RUNNING (for the same
+\* reason as LeaderCandidateCompleteness).
+LeaderCompletenessProperty ==
+    \* if something got committed then do the check
+    IF inv_true_hwm > 1
+    THEN 
+         \* If there is a running leader then it should host the committed data
+        LET leader == con_partition_metadata.leader
+        IN  
+            IF \/ leader = NoLeader
+            \/ /\ leader # NoLeader
+                /\ broker_state[leader].status # RUNNING
+            THEN TRUE \* If there is no leader or the leader isn't running then
+                    \* this property cannot be verified.
+            ELSE \* The leader LEO is not lower than the True HWM.
+                /\ partition_data[leader].leo >= inv_true_hwm
+                \* also check positively acknowledged writes exist in the leader log.
+                /\ \A v \in inv_pos_acked :  
+                    \E offset \in DOMAIN partition_data[leader].log :
+                        partition_data[leader].log[offset].value = v
+    ELSE TRUE
 
-\* INV: NoPartitionLogDivergence
-\* The partition log on the leader must be consistent with
-\* every follower (up to the HWM per replica).
-NoPartitionLogDivergence == 
+\* INV: LogMatchingProperty
+\* The stable prefix of the partition on each replica must be 
+\* consistent with every other. For each replica pair, this 
+\* checks up to the min of (b1 HWM, b2 HWM).
+LogMatchingProperty == 
     \A offset \in 1..Cardinality(Values) :
         ~\E b1, b2 \in Brokers :
             /\ partition_data[b1].leo > offset
@@ -143,44 +164,56 @@ NoPartitionLogDivergence ==
             /\ partition_data[b2].hwm > offset
             /\ partition_data[b1].log[offset].value # partition_data[b2].log[offset].value
 
-\* INV: NoMetadataLogDivergence
+\* INV: MetadataLogMatchingProperty
 \* The metadata log on the controller must be consistent with
 \* every broker (up to the last offset per broker).
-NoMetadataLogDivergence == 
+MetadataLogMatchingProperty == 
     \A offset \in 1..Len(con_metadata_log) :
         ~\E b \in Brokers :
             /\ Len(broker_metadata_log[b]) >= offset
             /\ broker_metadata_log[b][offset] # con_metadata_log[offset]
 
 \*INV: NoCommittedRecordLostGlobally
-\* LeaderHasCompleteCommittedLog prefered as it triggers earlier.
-\* Losing an acknowledged record on the leader ultimately
-\* results in global data loss for that record.
+\* This is useful as the LeaderCompleteness property only checks
+\* leaders, not situations where data is lost and there is no
+\* viable leader to elect. This will trigger if you set the number
+\* of unclean shutdowns to match the MinISR. So if you want to check
+\* LeaderCompleteness even under high unclean shutdown counts, do not
+\* enable this invariant.
 NoCommittedRecordLostGlobally ==
     \A v \in inv_pos_acked :
         \E b \in Brokers :
             \E offset \in LogOffsets(b) :
                 partition_data[b].log[offset].value = v
 
-\* INV: ConsumedRecordsMatchLeaderLog
+\* INV: ConsistentReadProperty
 \* Ensures consistency between records read in the past
 \* and the current leader log. 
 \* Consumers can consume up to the HWM. If a consumer consumes
 \* a record at a given offset, then later the record at that
-\* same offset does not exist or has changed, this invariant is violated. 
-ConsumedRecordsMatchLeaderLog ==
-    \A b \in Brokers :
+\* same offset does not exist or has changed, this invariant is violated.
+\* This isn't quite enough for checking linearizability, that will
+\* require checking producer acknowledgements - future work.
+ConsistentReadProperty ==
+    \* consistent (repeatable reads)
+    /\ \A b \in Brokers :
         IF IsNonStaleLeader(b)
         THEN \A offset \in DOMAIN inv_consumed :
                 /\ offset \in LogOffsets(b)
                 /\ partition_data[b].log[offset] = inv_consumed[offset]
         ELSE TRUE
-
-TestInv == 
+        
+TestInv ==
     TRUE
-
+    
 \* ========================================================
 \* LIVENESS
+\*
+\* Note that liveness checks are predicated on the fact that
+\* actions which help the cluster make progress or heal the
+\* cluster are eventually allowed to occur. This means the
+\* specification explores all histories where eventually the
+\* cluster can return to normal.
 \* ========================================================
 
 \* LIVENESS: EventuallyRuns
@@ -211,22 +244,17 @@ AlterPartitionEpochEventuallyReachedOrZero ==
 \* Eventually, each broker converges on the same metadata as the controller.
 EventuallyMetadataConverges ==
     []<>(\A b \in Brokers : 
-            /\ partition_metadata[b].isr = con_partition_metadata.isr
-            /\ partition_metadata[b].leader = con_partition_metadata.leader
-            /\ partition_metadata[b].leader_epoch = con_partition_metadata.leader_epoch
-            /\ partition_metadata[b].partition_epoch = con_partition_metadata.partition_epoch)
-
-\* LIVENESS: EventuallyHighwaterMarkAdvances
-\* Once a value is written to the log
-\*EventuallyHighwaterMarkAdvances ==
-\*    \A v \in Values :
-\*        (ValueWritten(v)) ~>
-\*             (\/ ValueNegAcked(v)
-\*              \/ \E b \in Brokers :
-\*                  /\ IsNonStaleLeader(b)
-\*                  /\ \E offset \in LogOffsets(b) :
-\*                     /\ partition_data[b].log[offset].value = v
-\*                     /\ partition_data[b].hwm >= offset)
+            \* either the metadata has converged
+            \/ /\ partition_metadata[b].isr = con_partition_metadata.isr
+               /\ partition_metadata[b].leader = con_partition_metadata.leader
+               /\ partition_metadata[b].leader_epoch = con_partition_metadata.leader_epoch
+               /\ partition_metadata[b].partition_epoch = con_partition_metadata.partition_epoch
+            \* or this is a follower and there are no further relevant records
+            \* (this spec reduces state space by pausing metadata replication when no relevant unreplicated records exist)
+            \/ /\ partition_status[b] = Follower
+               /\ ~\E md_offset \in UnreplicatedOffsets(b) :
+                    PartitionNeedsAction(b, md_offset))
+                    
 
 \* LIVENESS: EventuallyWriteIsAcceptedOrRejected
 \* A produce request will eventually be positively or negatively acknowledged
@@ -241,8 +269,18 @@ EventuallyWriteIsAcceptedOrRejected ==
 EventuallyAcknowledgedValueFullyReplicated ==
     \A v \in Values :
         v \in inv_pos_acked ~>
-                \A b \in Brokers : 
+                \A b \in con_partition_metadata.replicas : 
                     \E offset \in LogOffsets(b) :
                         partition_data[b].log[offset].value = v
+
+
+\* LIVENESS: EventuallyReassignmentCompletes
+\* A reassignment should eventually complete.
+EventuallyReassignmentCompletes ==
+    \/ con_partition_metadata.adding # {}
+    \/ con_partition_metadata.removing # {} ~>
+            /\ con_partition_metadata.adding = {}
+            /\ con_partition_metadata.removing = {}
+
       
 =============================================================================    

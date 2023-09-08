@@ -1,8 +1,8 @@
---------------------------- MODULE v_elr_properties ---------------------------
+--------------------------- MODULE kip_966_properties ---------------------------
 EXTENDS FiniteSets, FiniteSetsExt, Sequences, SequencesExt, Integers, TLC,
         message_passing,
-        v_elr_types,
-        v_elr_functions
+        kip_966_types,
+        kip_966_functions
 
 \* ===============================================================
 \* INVARIANTS
@@ -20,6 +20,9 @@ TypeOK ==
     /\ partition_replica_state \in [Brokers -> [Brokers -> PeerReplicaState]]
     /\ aux_ctrs \in StateSpaceLimitCtrs
     /\ partition_status \in [Brokers -> {Leader, Follower, Nil}]
+    /\ inv_sent \in SUBSET Values
+    /\ inv_pos_acked \in SUBSET Values
+    /\ inv_neg_acked \in SUBSET Values
 
 \* INV: ValidBrokerState
 \* For catching spec bugs, ensure broker state is legal.
@@ -74,60 +77,36 @@ ValidControllerState ==
         \/ /\ con_broker_reg[b].status = UNFENCED
            /\ b \notin con_unfenced
     \* A fenced broker cannot be in the ISR
-    /\ ~\E b \in Brokers :
+    /\ ~\E b \in con_partition_metadata.replicas :
            /\ con_broker_reg[b].status = FENCED
            /\ b \in con_partition_metadata.isr
 
-\* INV: Valid fetching
-\* Makes sure that the fetching abstraction used in this spec
-\* does not allow more than one fetch/response between any
-\* two brokers at the same time.
-ValidFetching ==
-    ~\E b1, b2 \in Brokers :
-        /\ b1 # b2
-        /\ \E m \in DOMAIN messages :
-            /\ m.type = FetchRequest
-            /\ m.source = b1
-            /\ m.dest = b2
-            /\ messages[m] > 0 \* is inflight
-        /\ \E m \in DOMAIN messages :
-            /\ m.type = FetchResponse
-            /\ m.source = b2
-            /\ m.dest = b1
-            /\ messages[m] > 0 \* is inflight
-
 \* INV: ValidControllerIsrAndElr
+\* For catching spec bugs, ensure controller state is legal.
 ValidControllerIsrAndElr ==
+    \* ISR and ELR members must be replicas
+    /\ \A b \in con_partition_metadata.isr :
+        b \in con_partition_metadata.replicas
+    /\ \A b \in con_partition_metadata.elr :
+        b \in con_partition_metadata.replicas
     \* no member of the ELR is also in the ISR
     /\ ~\E b \in con_partition_metadata.elr :
         b \in con_partition_metadata.isr
-    \* If the ISR <= MinISR then number of members of 
-    \* the combined ISR and ELR does not exceed MinISR.
-    /\ IF Cardinality(con_partition_metadata.isr) < MinISR
-       THEN Cardinality(con_partition_metadata.isr) + 
-                Cardinality(con_partition_metadata.elr) <= MinISR
-       ELSE TRUE
-    \* No member of the ISR is missing committed records
-    \* and is RUNNING 
-    /\ ~\E b \in con_partition_metadata.isr :
-        /\ partition_data[b].leo < inv_true_hwm
-        /\ broker_state[b].status = RUNNING
-    \* No member of the ELR is missing committed records
-    \* and is RUNNING
-    /\ ~\E b \in con_partition_metadata.elr :
-        /\ partition_data[b].leo < inv_true_hwm
-        /\ broker_state[b].status = RUNNING
+    \* If the ISR >= MinISR then the ELR must be empty
+    /\ IF Cardinality(con_partition_metadata.isr) >= MinISR
+       THEN con_partition_metadata.elr = {}
+       ELSE TRUE    
     
-\* INV: ValidLeaderMaximalISR
+\* INV: ReplicationQuorumSupersetProperty
 \* The maximal ISR is critical for safety. The invariant here is that
 \* the maximal ISR on the (non-stale) leader must be a superset of
-\* the controller ISR. Else we can lose data.
-\* (Triggers soon than invariant LeaderHasCompleteCommittedLog). 
+\* the controller ISR + ELR iff the ISR on the leader is >= MinISR.
+\* Else we can end up violating Leader Candidate Completeness. 
 IsNonStaleLeader(b) ==
     /\ partition_status[b] = Leader
     /\ partition_metadata[b].leader_epoch = con_partition_metadata.leader_epoch
 
-ValidLeaderMaximalISR ==
+ReplicationQuorumSupersetProperty ==
     \A b \in Brokers :
         \* if the leader is a non-stale leader
         IF IsNonStaleLeader(b)
@@ -136,43 +115,70 @@ ValidLeaderMaximalISR ==
               /\ IF ~PendingAlterPartitionResponse(b)
                  THEN partition_metadata[b].maximal_isr = partition_metadata[b].isr
                  ELSE TRUE
-              \* the leader maximal ISR must be a superset of the controller  
-              \* ISR U ELR when the leader ISR >= MinISR
+              \* If leader ISR >= MinISR then the leader maximal ISR must 
+              \* be a superset of the controller ISR + ELR
               /\ IF Cardinality(partition_metadata[b].isr) >= MinISR
                  THEN /\ \A b1 \in con_partition_metadata.isr :
-                            b1 \in partition_metadata[b].maximal_isr
+                           b1 \in partition_metadata[b].maximal_isr
                       /\ \A b1 \in con_partition_metadata.elr :
-                            b1 \in partition_metadata[b].maximal_isr
+                           b1 \in partition_metadata[b].maximal_isr  
                  ELSE TRUE
         ELSE TRUE
 
-\* INV: ControllerIsrHasUpToTrueHWM
-\* The true HWM is tracked by the spec (not the brokers)
-\* and if any replica in the ISR has an LEO < the true
-\* HWM, then that is an illegal state which can lead
-\* to data loss. 
-\* (Triggers soon than invariant LeaderHasCompleteCommittedLog).
-ControllerIsrHasUpToTrueHWM ==
-    \* No member of the ISR is missing committed records
-    \* and is RUNNING 
-    /\ ~\E b \in con_partition_metadata.isr :
-        /\ partition_data[b].leo < inv_true_hwm
-        /\ broker_state[b].status = RUNNING
+\* INV: LeaderCandidateCompletenessProperty
+\* The True HWM is tracked by the spec (not the brokers)
+\* and if any replica in the ISR or ELR has an LEO < the True
+\* HWM, then that violates this property. Note that
+\* this only applies for IS/ELR members that are running. If a replica
+\* just experienced a lossy unclean shutdown then it might not
+\* host all committed data - but the Unclean Exclusion property
+\* guarantees that once it is running again, it cannot be in the ISR
+\* until it has proven itself by catching up to the new leader.
+LeaderCandidateCompletenessProperty ==
+    \* if something got committed then do the check
+    IF inv_true_hwm > 1
+    THEN 
+         \* No member of the ISR or ELR is missing committed records
+         \* and is RUNNING 
+         /\ ~\E b \in con_partition_metadata.isr :
+             /\ partition_data[b].leo < inv_true_hwm
+             /\ broker_state[b].status = RUNNING
+         /\ ~\E b \in con_partition_metadata.elr :
+             /\ partition_data[b].leo < inv_true_hwm
+             /\ broker_state[b].status = RUNNING
+    ELSE TRUE
 
-\* INV: LeaderHasCompleteCommittedLog
+\* INV: LeaderCompletenessProperty
 \* The replica selected as leader by the controller must have
-\* the entire acknowledged log else this is data loss.
-LeaderHasCompleteCommittedLog ==
-    \/ con_partition_metadata.leader = NoLeader
-    \/ /\ con_partition_metadata.leader # NoLeader
-       /\ \A v \in inv_pos_acked :
-            \E offset \in DOMAIN partition_data[con_partition_metadata.leader].log :
-                partition_data[con_partition_metadata.leader].log[offset].value = v
+\* the entire committed log else this is data loss. Again,
+\* this only applies if the leader is RUNNING (for the same
+\* reason as LeaderCandidateCompletenessProperty).
+LeaderCompletenessProperty ==
+    \* if something got committed then do the check
+    IF inv_true_hwm > 1
+    THEN 
+         \* If there is a running leader then it should host the committed data
+         LET leader == con_partition_metadata.leader
+         IN  
+            IF \/ leader = NoLeader
+               \/ /\ leader # NoLeader
+                  /\ broker_state[leader].status # RUNNING
+            THEN TRUE \* If there is no leader or the leader isn't running then
+                      \* this property cannot be verified.
+            ELSE \* The leader LEO is not lower than the True HWM.
+                 /\ partition_data[leader].leo >= inv_true_hwm
+                 \* also check positively acknowledged writes exist in the leader log.
+                 /\ \A v \in inv_pos_acked :  
+                      \E offset \in DOMAIN partition_data[leader].log :
+                          partition_data[leader].log[offset].value = v
 
-\* INV: NoPartitionLogDivergence
-\* The partition log on the leader must be consistent with
-\* every follower (up to the HWM per replica).
-NoPartitionLogDivergence == 
+    ELSE TRUE
+    
+\* INV: LogMatchingProperty
+\* The stable prefix of the partition on each replica must be 
+\* consistent with every other. For each replica pair, this 
+\* checks up to the min of (b1 HWM, b2 HWM).
+LogMatchingProperty == 
     \A offset \in 1..Cardinality(Values) :
         ~\E b1, b2 \in Brokers :
             /\ partition_data[b1].leo > offset
@@ -181,54 +187,63 @@ NoPartitionLogDivergence ==
             /\ partition_data[b2].hwm > offset
             /\ partition_data[b1].log[offset].value # partition_data[b2].log[offset].value
 
-\* INV: NoMetadataLogDivergence
+\* INV: MetadataLogMatchingProperty
 \* The metadata log on the controller must be consistent with
 \* every broker (up to the last offset per broker).
-NoMetadataLogDivergence == 
+MetadataLogMatchingProperty == 
     \A offset \in 1..Len(con_metadata_log) :
         ~\E b \in Brokers :
             /\ Len(broker_metadata_log[b]) >= offset
             /\ broker_metadata_log[b][offset] # con_metadata_log[offset]
 
 \*INV: NoCommittedRecordLostGlobally
-\* LeaderHasCompleteCommittedLog prefered as it triggers earlier.
-\* Losing an acknowledged record on the leader ultimately
-\* results in global data loss for that record.
+\* This is useful as the LeaderCompleteness property only checks
+\* leaders, not situations where data is lost and there is no
+\* viable leader to elect. This will trigger if you set the number
+\* of unclean shutdowns to match the MinISR. So if you want to check
+\* LeaderCompleteness even under high unclean shutdown counts, do not
+\* enable this invariant.
 NoCommittedRecordLostGlobally ==
     \A v \in inv_pos_acked :
         \E b \in Brokers :
             \E offset \in LogOffsets(b) :
                 partition_data[b].log[offset].value = v
 
-\* INV: ConsumedRecordsMatchLeaderLog
+\* INV: ConsistentReadProperty
 \* Ensures consistency between records read in the past
 \* and the current leader log. 
 \* Consumers can consume up to the HWM. If a consumer consumes
 \* a record at a given offset, then later the record at that
-\* same offset does not exist or has changed, this invariant is violated. 
-ConsumedRecordsMatchLeaderLog ==
-    \A b \in Brokers :
+\* same offset does not exist or has changed, this invariant is violated.
+\* This isn't quite enough for checking linearizability, that will
+\* require checking producer acknowledgements - future work.
+ConsistentReadProperty ==
+    \* consistent (repeatable reads)
+    /\ \A b \in Brokers :
         IF IsNonStaleLeader(b)
         THEN \A offset \in DOMAIN inv_consumed :
                 /\ offset \in LogOffsets(b)
                 /\ partition_data[b].log[offset] = inv_consumed[offset]
         ELSE TRUE
-
-TestInv == 
+        
+MinIsrRecoveryQuorum ==
+    IF /\ con_partition_metadata.isr = {}
+       /\ con_partition_metadata.elr = {}
+    THEN Cardinality(con_partition_metadata.last_known_elr) = MinISR
+    ELSE TRUE
+        
+TestInv ==
     TRUE
-
+    
 \* ========================================================
 \* LIVENESS
+\*
+\* Note that liveness checks are predicated on the fact that
+\* actions which help the cluster make progress or heal the
+\* cluster are eventually allowed to occur. This means the
+\* specification explores all histories where eventually the
+\* cluster can return to normal.
 \* ========================================================
-
-HwmBlockedByStateSpaceLimits(b) ==
-    /\ aux_ctrs.alter_part_ctr = AlterPartitionLimit
-    /\ Cardinality(partition_metadata[b].isr) < MinISR
-    
-NoCleanElectionPossible ==
-    /\ con_partition_metadata.isr = {}
-    /\ con_partition_metadata.elr = {}
-    /\ con_partition_metadata.leader = NoLeader    
 
 \* LIVENESS: EventuallyRuns
 \* Eventually, a broker that has STARTING status, reaches RUNNING.
@@ -258,26 +273,24 @@ AlterPartitionEpochEventuallyReachedOrZero ==
 \* Eventually, each broker converges on the same metadata as the controller.
 EventuallyMetadataConverges ==
     []<>(\A b \in Brokers : 
-            /\ partition_metadata[b].isr = con_partition_metadata.isr
-            /\ partition_metadata[b].leader = con_partition_metadata.leader
-            /\ partition_metadata[b].leader_epoch = con_partition_metadata.leader_epoch
-            /\ partition_metadata[b].partition_epoch = con_partition_metadata.partition_epoch)
+            \* either the metadata has converged
+            \/ /\ partition_metadata[b].isr = con_partition_metadata.isr
+               /\ partition_metadata[b].leader = con_partition_metadata.leader
+               /\ partition_metadata[b].leader_epoch = con_partition_metadata.leader_epoch
+               /\ partition_metadata[b].partition_epoch = con_partition_metadata.partition_epoch
+            \* or this is a follower and there are no further relevant records
+            \* (this spec reduces state space by pausing metadata replication when no relevant unreplicated records exist)
+            \/ /\ partition_status[b] = Follower
+               /\ ~\E md_offset \in UnreplicatedOffsets(b) :
+                    PartitionNeedsAction(b, md_offset))
+                    
 
 \* LIVENESS: EventuallyWriteIsAcceptedOrRejected
 \* A produce request will eventually be positively or negatively acknowledged
-\* This liveness property has been modified for the ELR spec because
-\* the HWM cannot progress when the ISR < MinISR and we limit the
-\* number of AlterPartition requests which means we may end up with an ISR of
-\* 1 that cannot be expanded due to the state space limit - which will
-\* cause this property to be violated.
 EventuallyWriteIsAcceptedOrRejected ==
     \A v \in Values :
         v \in inv_sent ~> \/ v \in inv_pos_acked
                           \/ v \in inv_neg_acked
-                          \/ \E b \in Brokers :
-                                /\ IsNonStaleLeader(b)
-                                /\ HwmBlockedByStateSpaceLimits(b)
-                          \/ NoCleanElectionPossible
 
 \* LIVENESS: EventuallyAcknowledgedValueFullyReplicated
 \* A record that gets positively acknowledged eventually becomes
@@ -285,9 +298,18 @@ EventuallyWriteIsAcceptedOrRejected ==
 EventuallyAcknowledgedValueFullyReplicated ==
     \A v \in Values :
         v \in inv_pos_acked ~>
-                \/ \A b \in Brokers : 
+                \A b \in con_partition_metadata.replicas : 
                     \E offset \in LogOffsets(b) :
                         partition_data[b].log[offset].value = v
-                \/ NoCleanElectionPossible
+
+
+\* LIVENESS: EventuallyReassignmentCompletes
+\* A reassignment should eventually complete.
+EventuallyReassignmentCompletes ==
+    \/ con_partition_metadata.adding # {}
+    \/ con_partition_metadata.removing # {} ~>
+            /\ con_partition_metadata.adding = {}
+            /\ con_partition_metadata.removing = {}
+
       
 =============================================================================    

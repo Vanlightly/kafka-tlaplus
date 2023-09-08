@@ -1,6 +1,6 @@
 --------------------------- MODULE v3_5_functions ---------------------------
 EXTENDS FiniteSets, FiniteSetsExt, Sequences, SequencesExt, Integers, TLC,
-        v3_5_types
+        v3_5_types, message_passing
 
 \* ======================================================================
 \* ------------ Helpers -------------------------------------------------
@@ -23,12 +23,6 @@ LeoOf(b) ==
 HwmOf(b) ==
     partition_data[b].hwm
 
-PartitionMetadata(b) ==
-    partition_metadata[b]
-
-PartitionData(b) ==
-    partition_data[b]
-
 ReplicaState(b1, b2) ==
     partition_replica_state[b1][b2]    
 
@@ -45,13 +39,25 @@ IsPartitionAdded(b1, b2) ==
 BlankReplicaState ==
     [leo              |-> Nil,
      broker_epoch     |-> 0]
+     
+BlankMetadata ==
+    [replicas        |-> {},
+     isr             |-> {},
+     maximal_isr     |-> {},
+     leader          |-> NoLeader,
+     leader_epoch    |-> 0,
+     partition_epoch |-> 0]     
 
-\* A replica resets its peer replica state when it changes role.
-\* If it has become a leader then it sets its own replica state as this
-\* spec uses that when computing the HWM advancement.    
-ResetReplicaState(b) ==
+ResetAllFollowerState(b) ==
     partition_replica_state' = [partition_replica_state EXCEPT ![b] = 
                                     [b1 \in Brokers |-> BlankReplicaState]]
+                                    
+ResetFollowerStateOfAllButISR(b, new_part_md) ==
+    partition_replica_state' = [partition_replica_state EXCEPT ![b] = 
+                                    [b1 \in Brokers |->
+                                        IF b1 \notin new_part_md.isr
+                                        THEN BlankReplicaState
+                                        ELSE partition_replica_state[b][b1]]]                                    
 
 \* partition_pending_ap is used by the spec to know when it is pending 
 \* an AP request. If the epoch is higher than the current partition epoch
@@ -63,15 +69,22 @@ ResetPendingAlterPartition(b) ==
 
 \* TRUE if we are expecting a response with a higher partition epoch
 PendingAlterPartitionResponse(b) ==
-    partition_pending_ap[b].epoch > PartitionMetadata(b).partition_epoch
+    partition_pending_ap[b].epoch > partition_metadata[b].partition_epoch
+    
+IsLeaderEpochBump(b, md_offset) ==
+    con_metadata_log[md_offset].leader_epoch > partition_metadata[b].leader_epoch    
+
+ReassignmentInProgress ==
+    \/ con_partition_metadata.adding # {}
+    \/ con_partition_metadata.removing # {}
 
 \* ==========================================================================
-\* -- Anti-cycle checks (for liveness properties and state space limiting) --
+\* -- State-space reducers and anti-cycle checks 
+\*    (for liveness properties and state space limiting) --
 \*
 \* To avoid cycles such as infinite fetch request/responses, the spec limits
 \* fetch requests to when they are required to make progress.
 \* Generally speaking, you can ignore this.
-
 
 \* This magic formula is able to see the state on both the local replica
 \* and the leader (which the replica can't actually do) and figure out
@@ -79,8 +92,8 @@ PendingAlterPartitionResponse(b) ==
 \* This requires **great care** to avoid hiding legal behaviors that could
 \* result in invariant or liveness violations.
 __SendFetchMakesProgress(b) ==
-    LET leader == PartitionMetadata(b).leader
-        matching_epoch == PartitionMetadata(b).leader_epoch = PartitionMetadata(leader).leader_epoch
+    LET leader == partition_metadata[b].leader
+        matching_epoch == partition_metadata[b].leader_epoch = partition_metadata[leader].leader_epoch
     IN \* Limit when fetch requests can be sent according to the leader epoch on leader and follower
        /\ CASE 
             \* --- CASE Delayed partition but leader epoch doesn't match ------------------------
@@ -103,25 +116,46 @@ __SendFetchMakesProgress(b) ==
              /\ ReplicaState(leader, b).leo < LeoOf(b)
 
 \* This prevents a replica from processing a fetch request with a larger leader
-\* epoch than its own. It shouldn't cause liveness issues as eventually the
-\* replica will learn of the new leader epoch.
+\* epoch than its own (when LimitFetchesOnLeaderEpoch=TRUE).
+\* It shouldn't cause liveness issues as eventually the replica will learn of 
+\* the new leader epoch.
 __ReceiveFetchMakesProgress(m) ==
     IF /\ LimitFetchesOnLeaderEpoch = TRUE
-       /\ m.partition.leader_epoch > PartitionMetadata(m.dest).leader_epoch
+       /\ m.partition.leader_epoch > partition_metadata[m.dest].leader_epoch
     THEN FALSE
     ELSE TRUE
-
-
-
+        
 \* ======================================================================
 \* ------------ Key functions -------------------------------------------
 \* These functions may be used in multiple places.
 
 \*----------------------------------------------------
+\* FUNCTION: UnreplicatedOffsets, PartitionNeedsAction
+\*
+\* Functions for metadata replication. PartitionNeedsAction
+\* is TRUE when the metadata record affects the local
+\* replica.
+
+UnreplicatedOffsets(b) ==
+    Len(broker_metadata_log[b])+1..Len(con_metadata_log)
+
+PartitionNeedsAction(b, md_offset) ==
+    \* Leaders react to all partition changes
+    \/ partition_status[b] = Leader 
+    \* Existing followers react to leader epoch bumps
+    \/ /\ b \in partition_metadata[b].replicas
+       /\ IsLeaderEpochBump(b, md_offset) 
+    \* New followers (being added) react
+    \/ /\ b \notin partition_metadata[b].replicas
+       /\ b \in con_metadata_log[md_offset].replicas
+
+
+\*----------------------------------------------------
 \* FUNCTION: CommitOffsetOnFetch, CommitOffsetOnUpdate, CommitOffsetOnWrite
 \*
 \* Find the highest (contiguous) offset that has been replicated
-\* to the leader's maximal ISR - nominally called the commit offset here.
+\* to the leader's maximal ISR - nominally called the commit offset here
+\* and is inclusive.
 
 IsCommitted(b, maximal_isr, replica_state, offset) ==
     \A b1 \in maximal_isr :
@@ -146,7 +180,7 @@ GetCommitOffset(b, maximal_isr, leo, replica_state) ==
 
 \* Only the replica state of one follower may have changed from current state
 CommitOffsetOnFetch(b, replica_state) ==
-    GetCommitOffset(b, PartitionMetadata(b).maximal_isr, 
+    GetCommitOffset(b, partition_metadata[b].maximal_isr, 
                     LeoOf(b), replica_state)
 
 \* Only the maximal ISR may have changed from current state
@@ -168,13 +202,16 @@ CommitOffsetOnWrite(b, new_leo) ==
 NoHighWatermarkChange ==
     UNCHANGED << partition_data, inv_vars >>
 
-\* rebuild the map setting the ack type for the specified range
-\* leaving the rest unchanged.
+\* Send producer acknowledgements for any records that this
+\* replica wrote to its log (it knows this by matching its
+\* current leader epoch to the epoch of the record).
 SendAcksFor(b, lower, higher, ack_type) ==
-    LET values == { v \in inv_sent : /\ v \notin inv_pos_acked
+    LET curr_epoch == partition_metadata[b].leader_epoch
+        values == { v \in inv_sent : /\ v \notin inv_pos_acked
                                      /\ v \notin inv_neg_acked
                                      /\ \E offset \in lower..higher :
-                                          LogEntry(b, offset).value = v }
+                                          /\ LogEntry(b, offset).value = v
+                                          /\ LogEntry(b, offset).epoch = curr_epoch }
     IN 
        IF ack_type = TRUE 
        THEN /\ inv_pos_acked' = inv_pos_acked \union values
@@ -206,8 +243,8 @@ MaybeAdvanceHighWatermark(b, old_hwm, new_hwm, ack_type) ==
 \* FUNCTION: MaybeFailPendingWrites
 \*
 \* If the ISR is now below MinISR or the replica lost leadership
-\* then negatively acknowledge all unacknowledged records above
-\* the high watermark.
+\* then negatively acknowledge all unacknowledged records from
+\* the high watermark and up.
 
 FailPendingWrites(b) ==
     SendAcksFor(b, HwmOf(b), LeoOf(b)-1, FALSE)
@@ -220,7 +257,7 @@ MaybeFailPendingWrites(b, part_state) ==
     ELSE UNCHANGED << inv_sent, inv_pos_acked, inv_neg_acked >>
 
 \*----------------------------------------------------------------
-\* FUNCTION: MaybeUpdateHwmOnPartitionChange
+\* FUNCTION: MaybeUpdateHwmAndAckOnPartitionChange
 \*
 \* On learning of a partition change, whether due to an 
 \* AlterPartition response or from a metadata update, the leader
@@ -240,10 +277,10 @@ MaybeFailPendingWrites(b, part_state) ==
 \* still not have enough information on its followers to know to 
 \* compute the new high watermark.
 
-MaybeUpdateHwmOnPartitionChange(b, part_state, is_new_leader) ==
+MaybeUpdateHwmAndAckOnPartitionChange(b, part_md, is_new_leader) ==
     LET old_hwm == HwmOf(b)
-        new_hwm == CommitOffsetOnUpdate(b, part_state.maximal_isr) + 1
-        ack_type == IF Cardinality(part_state.maximal_isr) >= MinISR
+        new_hwm == CommitOffsetOnUpdate(b, part_md.maximal_isr) + 1
+        ack_type == IF Cardinality(part_md.maximal_isr) >= MinISR
                     THEN TRUE ELSE FALSE
     IN MaybeAdvanceHighWatermark(b, old_hwm, new_hwm, ack_type)
 
@@ -257,23 +294,30 @@ MaybeUpdateHwmOnPartitionChange(b, part_state, is_new_leader) ==
 NoPartitionChange ==
     UNCHANGED << con_partition_metadata, con_metadata_log >>
 
-ApplyPartitionChange(new_leader, new_isr, leader_epoch, 
-                     part_epoch) ==
+ApplyPartitionChange(new_replicas, new_leader, new_isr,
+                     leader_epoch, part_epoch, adding, removing) ==
     /\ con_partition_metadata' = 
-               [isr             |-> new_isr,
-                leader          |-> new_leader, 
+               [replicas        |-> new_replicas,
+                isr             |-> new_isr,
+                leader          |-> new_leader,
                 leader_epoch    |-> leader_epoch,
-                partition_epoch |-> part_epoch]
+                partition_epoch |-> part_epoch,
+                adding          |-> adding,
+                removing        |-> removing]
     /\ con_metadata_log' = 
           Append(con_metadata_log,
                 [type            |-> PartitionChangeRecord,
-                 leader          |-> new_leader,
+                 replicas        |-> new_replicas,
                  isr             |-> new_isr,
+                 leader          |-> new_leader,
                  leader_epoch    |-> leader_epoch,
-                 partition_epoch |-> part_epoch])
+                 partition_epoch |-> part_epoch,
+                 adding          |-> adding,
+                 removing        |-> removing])
 
 \*--------------------------------------------------------------
-\* FUNCTION: MaybeUpdatePartitionMetadata, MaybeRemoveBrokerFromISR
+\* FUNCTION: MaybeUpdatePartitionOnBrokerChange,
+\*           MaybeRemoveBrokerFromISR
 
 \* The ISR cannot drop below 1
 MaybeRemoveBrokerFromISR(isr, b) ==
@@ -292,7 +336,7 @@ NoLeaderChange(new_isr, new_unfenced) ==
 
 \* Based on the new ISR and unfenced broker set, decide
 \* whether a partition state change is required or not.
-MaybeUpdatePartitionMetadata(new_isr, new_unfenced) ==
+MaybeUpdatePartitionOnBrokerChange(new_isr, new_unfenced) ==
     LET md == con_partition_metadata
     IN
         CASE /\ NoLeaderChange(new_isr, new_unfenced)
@@ -303,25 +347,28 @@ MaybeUpdatePartitionMetadata(new_isr, new_unfenced) ==
              /\ new_isr # md.isr ->
                 \* basically, ISR change but no leader change. 
                 \* Update partition state and append partition change record.
-                ApplyPartitionChange(md.leader, new_isr, 
-                                     md.leader_epoch,
-                                     md.partition_epoch + 1)
+                ApplyPartitionChange(md.replicas, md.leader,  
+                                     new_isr, md.leader_epoch,
+                                     md.partition_epoch + 1,
+                                     md.adding, md.removing)
           [] \E candidate \in new_isr : candidate \in new_unfenced ->
                 \* basically, at the very least, there is a leader change.
                 \* Non-deterministically choose a valid candidate for leader.
                 \* Update partition state and append partition change record.
                 \E candidate \in new_isr :
                     /\ candidate \in new_unfenced
-                    /\ ApplyPartitionChange(candidate, new_isr, 
+                    /\ ApplyPartitionChange(md.replicas, candidate, new_isr, 
                                             md.leader_epoch + 1,
-                                            md.partition_epoch + 1)
+                                            md.partition_epoch + 1,
+                                            md.adding, md.removing)
           [] ~\E candidate \in new_isr : candidate \in new_unfenced ->
                 \* The ISR remains the same, but there is no leader.
                 \* This is the case where the ISR was 1 and the leader got fenced.
                 \* Update partition state and append partition change record.
-                ApplyPartitionChange(NoLeader, new_isr, 
+                ApplyPartitionChange(md.replicas, NoLeader, new_isr, 
                                      md.leader_epoch + 1,
-                                     md.partition_epoch + 1)
+                                     md.partition_epoch + 1,
+                                     md.adding, md.removing)
           [] OTHER -> \* no-op 
                 NoPartitionChange
 
@@ -331,7 +378,7 @@ MaybeUpdatePartitionMetadata(new_isr, new_unfenced) ==
 HandleBrokerFenced(b) ==
     LET new_isr      == MaybeRemoveBrokerFromISR(con_partition_metadata.isr, b)
         new_unfenced == con_unfenced \ {b}
-    IN /\ MaybeUpdatePartitionMetadata(new_isr, new_unfenced)
+    IN /\ MaybeUpdatePartitionOnBrokerChange(new_isr, new_unfenced)
        /\ con_unfenced' = new_unfenced
 
 HandleBrokerUnfenced(b) ==
@@ -339,16 +386,19 @@ HandleBrokerUnfenced(b) ==
         new_unfenced == con_unfenced \union {b}
     IN \* if there is no leader the controller can choose one from the ISR.
        /\ IF con_partition_metadata.leader = NoLeader 
-          THEN MaybeUpdatePartitionMetadata(new_isr, new_unfenced)
+          THEN MaybeUpdatePartitionOnBrokerChange(new_isr, new_unfenced)
           ELSE NoPartitionChange
        /\ con_unfenced' = new_unfenced
 
 \*--------------------------------------------------------------
 \* FUNCTION: LastOffsetForEpoch
 
-\* Find the highest epoch in the log, or use the required epoch if
-\* none is lower or equal, and the start offset of the next highest
-\* epoch. The offset is exclusive.
+\* Find the highest epoch in the log <= the requested epoch, 
+\* or use the required epoch if none is lower or equal. Then
+\* find the start offset of the next highest epoch from that.
+\* The offset is exclusive. See the protocol description for
+\* a clearer explanation of this logic (which is much easier
+\* than trying to under this TLA+ code).
 
 NoEpochAndOffset == 
     [epoch |-> 0, offset |-> 0]
@@ -358,7 +408,7 @@ LastOffsetForEpoch(b, req_epoch, is_leader) ==
        \/ /\ LogOf(b) # <<>>
           /\ req_epoch = Last(LogOf(b)).epoch
        \/ /\ is_leader
-          /\ PartitionMetadata(b).leader_epoch = req_epoch
+          /\ partition_metadata[b].leader_epoch = req_epoch
     THEN [epoch |-> req_epoch, offset |-> LeoOf(b)]
     ELSE 
         LET higher_epoch_offset ==
@@ -375,7 +425,7 @@ LastOffsetForEpoch(b, req_epoch, is_leader) ==
                            \* Else, if this is the leader, the current leader epoch counts as a
                            \* higher epoch. If it is higher then choose the LEO.
                            ELSE IF /\ is_leader
-                                   /\ PartitionMetadata(b).leader_epoch > req_epoch
+                                   /\ partition_metadata[b].leader_epoch > req_epoch
                                 THEN LeoOf(b)
                                 ELSE Nil \* this should not happen so we set an illegal value to crash it.
             floor_epoch_offset == 
@@ -396,5 +446,38 @@ LastOffsetForEpoch(b, req_epoch, is_leader) ==
            ELSE [epoch  |-> req_epoch,
                  offset |-> higher_epoch_offset]
 
+\*--------------------------------------------------------------
+\* FUNCTION: DropFetchSessions
+
+\* Fetch requests are synchronous, one at a time and also protected 
+\* by fetch sessions not modeled in this spec (to reduce additional
+\* complexity) so we achieve the same properties by simply dropping 
+\* all inflight fetch requests and responses where this broker is 
+\* involved (to avoid these messages from being processed in the future).
+
+DropFetchSessions(b) ==
+    /\ messages' = [m \in DOMAIN messages |->
+                        CASE /\ m.type \in {FetchRequest, FetchResponse}
+                             /\ \/ m.dest = b
+                                \/ m.source = b -> 0 \* delivery count 0
+                          [] OTHER -> messages[m]]
+    \* All fetcher state on this broker is lost. Also, the fetches fail on
+    \* the brokers that have sent a fetch request to this broker.
+    /\ broker_fetchers' = [b1 \in Brokers |->
+                                CASE \* --- CASE local state lost --------------------------
+                                     b = b1 ->
+                                        [b2 \in Brokers |-> BlankFetchState]
+                                  \* --- CASE remote broker fetch request fails ------------
+                                  [] /\ broker_fetchers[b1][b].pending_response = TRUE
+                                     /\ broker_fetchers[b1][b].partition # Nil ->
+                                        [broker_fetchers[b1] EXCEPT ![b].pending_response = FALSE,
+                                                                    ![b].partition.delayed = TRUE]
+                                  \* --- CASE remote broker fetch request fails after removing partition --
+                                  [] /\ broker_fetchers[b1][b].pending_response = TRUE
+                                     /\ broker_fetchers[b1][b].partition = Nil ->
+                                        [broker_fetchers[b1] EXCEPT ![b].pending_response = FALSE]
+                                  \* --- CASE no change to unaffected fetch sessions --------
+                                  [] OTHER -> broker_fetchers[b1]]
+                                  \* CASE END
 
 =============================================================================    

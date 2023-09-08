@@ -1,18 +1,20 @@
---------------------------- MODULE v_elr_types ---------------------------
+--------------------------- MODULE kip_966_types ---------------------------
 EXTENDS FiniteSets, FiniteSetsExt, Sequences, SequencesExt, Integers, TLC
 
-CONSTANTS ReplicationFactor, \* the number of replicas (and brokers).
-          Values,            \* the producer data values that can be written
-          MinISR,            \* the min.insync.replicas
-          InitIsrSize        \* the initial ISR size. When InitIsrSize < ReplicationFactor
-                             \* a corresponding number of brokers start outside the ISR.
-                             \* This allows us to explore some scenarios that are too costly
-                             \* to reach with brute-force model checking.
+CONSTANTS BrokerCount,           \* the number of brokers (if higher than RF then reassignments can happen)
+          InitReplicationFactor, \* the initial replication factor (RF can change over time due to reassignments).
+          Values,                \* the producer data values that can be written
+          MinISR,                \* the min.insync.replicas
+          InitIsrSize            \* the initial ISR size. When InitIsrSize < ReplicationFactor
+                                 \* a corresponding number of brokers start outside the ISR.
+                                 \* This allows us to explore some scenarios that are too costly
+                                 \* to reach with brute-force model checking.
 \* state space limits
-CONSTANTS CleanShutdownLimit,       \* limits the number of clean shutdowns
-          UncleanShutdownLimit,     \* limits the number of unclean shutdowns
+CONSTANTS NoDataLossShutdownLimit,  \* limits the number of clean shutdowns
+          DataLossShutdownLimit,    \* limits the number of unclean shutdowns
           FenceBrokerLimit,         \* limits the number of times the controller arbitrarily fences a broker
-          AlterPartitionLimit,      \* limits the number of AlterPartition requests that can be sent
+          LeaderShrinkIsrLimit,     \* limits the number of AlterPartition requests can shrink the ISR
+          ReassignmentLimit,        \* limits the number of partition reassignments
           LimitFetchesOnLeaderEpoch \* limits the state space by reducing the number of FencedLeaderEpoch and
                                     \* UnknownLeaderEpochs errors from fetch requests
 
@@ -52,12 +54,21 @@ CONSTANTS Controller,        \* used to denote the destination or source of a me
 \* metadata log entry types
 CONSTANTS PartitionChangeRecord
 
-ASSUME InitIsrSize <= ReplicationFactor
-ASSUME MinISR <= ReplicationFactor
-ASSUME CleanShutdownLimit \in Nat
-ASSUME UncleanShutdownLimit \in Nat
+ASSUME BrokerCount \in Nat
+ASSUME InitReplicationFactor \in Nat
+ASSUME InitIsrSize \in Nat
+ASSUME MinISR \in Nat
+
+ASSUME InitReplicationFactor <= BrokerCount
+ASSUME InitIsrSize <= InitReplicationFactor
+ASSUME InitIsrSize >= MinISR
+ASSUME MinISR <= InitReplicationFactor
+
+ASSUME NoDataLossShutdownLimit \in Nat
+ASSUME DataLossShutdownLimit \in Nat
 ASSUME FenceBrokerLimit \in Nat
-ASSUME AlterPartitionLimit \in Nat
+ASSUME LeaderShrinkIsrLimit \in Nat
+ASSUME LimitFetchesOnLeaderEpoch \in BOOLEAN
 
 \* Controller state
 VARIABLES con_unfenced,           \* the set of brokers which are in the state UNFENCED.
@@ -77,6 +88,7 @@ VARIABLES broker_state,         \* state of each broker, such as status (RUNNING
 VARIABLES partition_status,         \* the role (leader, follower) and replication mode.
           partition_metadata,       \* the partition metadata state on each replica.
           partition_data,           \* the actual partition data, including HWM.
+          partition_leso,           \* the Leader Epoch Start Offset set by the leader of its leader epoch
           partition_replica_state,  \* a map (used by the leader) to track the state of follower replicas.
           partition_pending_ap      \* info related to a pending AlterPartition request.
 
@@ -96,14 +108,14 @@ con_broker_vars == << con_unfenced, con_broker_reg >>
 con_vars == << con_metadata_log,  con_broker_vars, con_partition_metadata >>
 broker_vars == << broker_state, broker_fetchers, broker_metadata_log >>
 part_vars == << partition_status, partition_metadata, partition_data,
-                partition_replica_state, partition_pending_ap >>
+                partition_leso, partition_replica_state, partition_pending_ap >>
 inv_vars == << inv_sent, inv_pos_acked, inv_neg_acked, inv_true_hwm, inv_consumed >>
 aux_vars == << aux_broker_epoch, aux_ctrs >>    
 
 \* The set of brokers. Note that broker ids and replica
 \* ids are the same, and so Brokers ids are used within replica logic
 \* contexts.
-Brokers == 1..ReplicationFactor
+Brokers == 1..BrokerCount
 
 \* ======================================================================
 \* ------------ Object type definitions ---------------------------------
@@ -135,14 +147,19 @@ PeerReplicaState ==
      broker_epoch: Nat]     
      
 ControllerPartitionMetadata ==
-    [isr: SUBSET Brokers,
+    [replicas: SUBSET Brokers,
+     isr: SUBSET Brokers,
      elr: SUBSET Brokers,
+     last_known_elr: SUBSET Brokers,
      leader: Brokers \union {NoLeader},
      leader_epoch: Nat,
-     partition_epoch: Nat]
+     partition_epoch: Nat,
+     adding: SUBSET Brokers,
+     removing: SUBSET Brokers]
      
 ReplicaPartitionMetadata ==
-    [isr: SUBSET Brokers,
+    [replicas: SUBSET Brokers,
+     isr: SUBSET Brokers,
      maximal_isr: SUBSET Brokers,
      leader: Brokers \union {NoLeader},
      leader_epoch: Nat,
@@ -159,15 +176,17 @@ PartitionLog ==
 PartitionDataType ==
     [log: PartitionLog,
      hwm: Nat,
-     leo: Nat,
-     epoch_start_offset: Nat \union {Nil}]
+     leo: Nat]
+
+PartitionLESO == Nat \union {Nil}
      
 StateSpaceLimitCtrs ==
     [incarn_ctr: Nat,
-     clean_shutdown_ctr: Nat,
-     unclean_shutdown_ctr: Nat,
+     data_loss_shutdown_ctr: Nat,
+     no_data_loss_shutdown_ctr: Nat,
      fence_broker_ctr: Nat,
-     alter_part_ctr: Nat]
+     leader_shrink_isr_ctr: Nat,
+     reassignment_ctr: Nat]
 
 \* ======================================================================
 \* ------------ Messages type definitions -------------------------------
@@ -176,7 +195,6 @@ RegisterBrokerRequestType ==
     [type: {RegisterBrokerRequest},
      broker_id: Nat,
      incarnation_id: Nat,
-     broker_epoch: Nat,
      dest: {Controller},
      source: Nat] 
 
@@ -184,6 +202,7 @@ RegisterBrokerResponseType ==
     [type: {RegisterBrokerResponse},
      broker_id: Nat,
      broker_epoch: Nat,
+     incarnation_id: Nat,
      metadata_offset: Nat, \* spec-only (not in implementation)
      dest: Nat,
      source: {Controller}]

@@ -1,18 +1,20 @@
 --------------------------- MODULE v3_5_types ---------------------------
 EXTENDS FiniteSets, FiniteSetsExt, Sequences, SequencesExt, Integers, TLC
 
-CONSTANTS ReplicationFactor, \* the number of replicas (and brokers).
-          Values,            \* the producer data values that can be written
-          MinISR,            \* the min.insync.replicas
-          InitIsrSize        \* the initial ISR size. When InitIsrSize < ReplicationFactor
-                             \* a corresponding number of brokers start outside the ISR.
-                             \* This allows us to explore some scenarios that are too costly
-                             \* to reach with brute-force model checking.
+CONSTANTS BrokerCount,           \* the number of brokers (if higher than RF then reassignments can happen)
+          InitReplicationFactor, \* the initial replication factor (RF can change over time due to reassignments).
+          Values,                \* the producer data values that can be written
+          MinISR,                \* the min.insync.replicas
+          InitIsrSize            \* the initial ISR size. When InitIsrSize < ReplicationFactor
+                                 \* a corresponding number of brokers start outside the ISR.
+                                 \* This allows us to explore some scenarios that are too costly
+                                 \* to reach with brute-force model checking.
 \* state space limits
 CONSTANTS CleanShutdownLimit,       \* limits the number of clean shutdowns
           UncleanShutdownLimit,     \* limits the number of unclean shutdowns
           FenceBrokerLimit,         \* limits the number of times the controller arbitrarily fences a broker
-          AlterPartitionLimit,      \* limits the number of AlterPartition requests that can be sent
+          LeaderShrinkIsrLimit,     \* limits the number of AlterPartition requests can shrink the ISR
+          ReassignmentLimit,        \* limits the number of partition reassignments
           AvoidLastReplicaStanding, \* When TRUE, does not follow actions that result in the LRS issue.
           LimitFetchesOnLeaderEpoch \* limits the state space by reducing the number of FencedLeaderEpoch and
                                     \* UnknownLeaderEpochs errors from fetch requests
@@ -53,12 +55,22 @@ CONSTANTS Controller,        \* used to denote the destination or source of a me
 \* metadata log entry types
 CONSTANTS PartitionChangeRecord
 
-ASSUME InitIsrSize <= ReplicationFactor
-ASSUME MinISR <= ReplicationFactor
+ASSUME BrokerCount \in Nat
+ASSUME InitReplicationFactor \in Nat
+ASSUME InitIsrSize \in Nat
+ASSUME MinISR \in Nat
+
+ASSUME InitReplicationFactor <= BrokerCount
+ASSUME InitIsrSize <= InitReplicationFactor
+ASSUME InitIsrSize >= MinISR
+ASSUME MinISR <= InitReplicationFactor
+
 ASSUME CleanShutdownLimit \in Nat
 ASSUME UncleanShutdownLimit \in Nat
 ASSUME FenceBrokerLimit \in Nat
-ASSUME AlterPartitionLimit \in Nat
+ASSUME LeaderShrinkIsrLimit \in Nat
+ASSUME AvoidLastReplicaStanding \in BOOLEAN
+ASSUME LimitFetchesOnLeaderEpoch \in BOOLEAN
 
 \* Controller state
 VARIABLES con_unfenced,           \* the set of brokers which are in the state UNFENCED.
@@ -105,7 +117,7 @@ aux_vars == << aux_broker_epoch, aux_ctrs >>
 \* The set of brokers. Note that broker ids and replica
 \* ids are the same, and so Brokers ids are used within replica logic
 \* contexts.
-Brokers == 1..ReplicationFactor
+Brokers == 1..BrokerCount
 
 \* ======================================================================
 \* ------------ Object type definitions ---------------------------------
@@ -137,13 +149,17 @@ PeerReplicaState ==
      broker_epoch: Nat]     
      
 ControllerPartitionMetadata ==
-    [isr: SUBSET Brokers,
+    [replicas: SUBSET Brokers,
+     isr: SUBSET Brokers,
      leader: Brokers \union {NoLeader},
      leader_epoch: Nat,
-     partition_epoch: Nat]
+     partition_epoch: Nat,
+     adding: SUBSET Brokers,
+     removing: SUBSET Brokers]
      
 ReplicaPartitionMetadata ==
-    [isr: SUBSET Brokers,
+    [replicas: SUBSET Brokers,
+     isr: SUBSET Brokers,
      maximal_isr: SUBSET Brokers,
      leader: Brokers \union {NoLeader},
      leader_epoch: Nat,
@@ -169,7 +185,8 @@ StateSpaceLimitCtrs ==
      clean_shutdown_ctr: Nat,
      unclean_shutdown_ctr: Nat,
      fence_broker_ctr: Nat,
-     alter_part_ctr: Nat]
+     leader_shrink_isr_ctr: Nat,
+     reassignment_ctr: Nat]
 
 \* ======================================================================
 \* ------------ Messages type definitions -------------------------------
@@ -185,6 +202,7 @@ RegisterBrokerResponseType ==
     [type: {RegisterBrokerResponse},
      broker_id: Nat,
      broker_epoch: Nat,
+     incarnation_id: Nat,
      metadata_offset: Nat, \* spec-only (not in implementation)
      dest: Nat,
      source: {Controller}]
