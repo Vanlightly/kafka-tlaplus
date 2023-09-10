@@ -1292,7 +1292,6 @@ DataLossShutdown ==
     /\ aux_ctrs.data_loss_shutdown_ctr < DataLossShutdownLimit
     /\ \E b \in Brokers :
         /\ broker_state[b].status \notin { OFFLINE_CLEAN, OFFLINE_DIRTY }
-        /\ aux_ctrs.fence_broker_ctr = 0
         \* state mutations
         /\ broker_state' = [broker_state EXCEPT ![b] = 
                                 [status            |-> OFFLINE_DIRTY,
