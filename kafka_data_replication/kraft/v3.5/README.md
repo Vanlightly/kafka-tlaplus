@@ -1,10 +1,19 @@
 # Kafka replication TLA+ specification and prose description
 
-This directory contains a [TLA+ specification](kafka_replication_v3_5.tla) of the Kafka replication protocol as of version 3.5.
+This directory contains:
+
+1. A [TLA+ specification](kafka_replication_v3_5.tla) of the Kafka replication protocol as of version 3.5.
+2. A [protocol description](description/0_kafka_replication_protocol.md) written in English prose with diagrams.
+
+It is recommended to read the protocol description before delving into the TLA+.
+
+## Protocol description
+
+The protocol description should be complete enough to understand the logical design of the replication protocol.
 
 ## TLA+ specification
 
-Be warned, this is a large specification.
+Be warned, this is a large specification which covers almost the entire protocol design rather than a highly abstracted version.
 
 ### The files
 
