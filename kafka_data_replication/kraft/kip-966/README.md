@@ -13,7 +13,7 @@ The protocol description should be complete enough to understand the logical des
 
 ## TLA+ specification
 
-Be warned, this is a large specification.
+Be warned, this is a large specification which covers almost the entire protocol design rather than a highly abstracted version.
 
 ### The files
 

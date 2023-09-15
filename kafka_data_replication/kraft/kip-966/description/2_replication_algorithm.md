@@ -335,7 +335,7 @@ The partition replicas will learn of any change to the partition metadata via Pa
 
 ## 2.9 Modifying the ISR (and ELR)
 
-Both the controller and the partition leader can modify the ISR and because both act independently the partition epoch is required to guarantee consistency. The ELR is only modified by the controller and based solely on the changes made to the ISR. The replica leader has no knowledge of the ELR at all.
+Both the controller and the partition leader can modify the ISR and because both act independently, the partition epoch is required to guarantee consistency. The ELR is only modified by the controller and based solely on the changes made to the ISR. The replica leader has no knowledge of the ELR at all.
 
 The controller is able to shrink the ISR down to empty but is not allowed to expand it (except for moving an ELR member to the ISR when the ISR is empty). It is the leader's job to expand the ISR as expansion is based on knowledge of the follower log and the controller knows nothing of this. The leader adds a follower to the ISR when the out-of-sync follower has become “in-sync”. 
 
@@ -428,7 +428,7 @@ Many of the actions taken in these transitions are discussed in [Replication Cor
 - The partition is removed from its current fetcher.
 - The replica ensures all follower state is cleared.
 - The replica sets the Leader Epoch Start Offset (LESO).
-- If the MinISR=1 then the leader can advance the HWM to its LEO.
+- If the ISR is only the leader and MinISR=1 then the leader can advance the HWM to its LEO.
 
 ### 2.10.2 Transition from leader-to-leader in the same leader epoch
 

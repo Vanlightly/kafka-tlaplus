@@ -45,3 +45,4 @@ Terms and acronyms used in this description:
 - Complete replica: A replica that hosts the complete committed log.
 - Unclean shutdown: An abrupt termination or one such that the full shutdown sequence could not execute.
 - Unclean replica/broker: A broker (and its replicas) which has restarted after an unclean shutdown.
+- MinISR: min.insync.replicas.
