@@ -1138,7 +1138,7 @@ WriteRecordToLeader ==
                               partition_replica_state, partition_pending_ap, messages, aux_vars >>
 
 (*-----------------------------------------------------------------------
-  ACTION: DataLossShutdown
+  ACTION: UncleanShutdown
   WHO: Broker
 
   A broker shutsdown uncleanly. In this spec, the entire partition log is 
@@ -1164,7 +1164,6 @@ UncleanShutdown ==
               /\ Cardinality(con_partition_metadata.isr) = 1
            THEN FALSE \* this action not enabled
            ELSE TRUE \* it is enabled
-        /\ aux_ctrs.fence_broker_ctr = 0
         \* state mutations
         /\ broker_state' = [broker_state EXCEPT ![b] = 
                                 [status            |-> OFFLINE_DIRTY,
