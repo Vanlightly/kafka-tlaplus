@@ -82,7 +82,7 @@ symmClients == Permutations(Clients)
 
 \* The set of topics and topic partitions (fixed)
 Topics == 1..TopicCount
-TopicPartitions == (1..TopicCount) \X (1..PartitionsPerTopic)
+SubscriptionPartitions == (1..TopicCount) \X (1..PartitionsPerTopic)
 
 GroupStatuses == {EMPTY, STABLE, ASSIGNING, RECONCILING }
 ClientStatuses == {RECONCILING, STABLE, FENCED, UNSUBSCRIBED,
@@ -120,8 +120,8 @@ GroupMemberState ==
      prev_member_epoch: Nat,
      subscribed: SUBSET Topics,
      status: MemberStatuses,
-     assigned_partitions: SUBSET TopicPartitions,
-     revoked_partitions: SUBSET TopicPartitions]
+     assigned_partitions: SUBSET SubscriptionPartitions,
+     revoked_partitions: SUBSET SubscriptionPartitions]
 
 JOIN_GROUP_MEMBER_EPOCH == 0
 LEAVE_GROUP_MEMBER_EPOCH == -1
@@ -133,24 +133,24 @@ ClientState ==
      member_epoch: Nat \union {-1},
      status: ClientStatuses,
      subscribed: SUBSET Topics,
-     curr_assignment: SUBSET TopicPartitions,
-     last_sent_partitions: SUBSET TopicPartitions \union {Nil},
-     assignment_to_reconcile: SUBSET TopicPartitions,
+     curr_assignment: SUBSET SubscriptionPartitions,
+     last_sent_partitions: SUBSET SubscriptionPartitions \union {Nil},
+     assignment_to_reconcile: SUBSET SubscriptionPartitions,
      has_inflight: BOOLEAN]
      
 ReconcileProcess ==
     [epoch_on_start: Nat,
-     assignment: SUBSET TopicPartitions]
+     assignment: SUBSET SubscriptionPartitions]
      
 LeaveProcess ==
-    [assignment: SUBSET TopicPartitions]
+    [assignment: SUBSET SubscriptionPartitions]
 
 HeartbeatRequest ==
     [type: {HeartbeatRequestMsg},
      member_id: Nat,
      member_epoch: Nat,
      subscribed: SUBSET Topics,
-     topic_partitions: SUBSET TopicPartitions,
+     topic_partitions: SUBSET SubscriptionPartitions,
      connection_id: Nat,
      source: Clients]
 
@@ -159,7 +159,7 @@ HeartbeatResponse ==
      error: Errors \union {Nil},
      member_epoch: Nat,
      member_id: Nat,
-     assignment: SUBSET TopicPartitions \union {Nil},
+     assignment: SUBSET SubscriptionPartitions \union {Nil},
      connection_id: Nat,
      dest: Clients]
 
@@ -428,10 +428,9 @@ ReceiveSuccessResponse(c) ==
                         IF IsValidTransition(cs.status, RECONCILING)
                         THEN 
                              IF m.assignment = cs.curr_assignment
-                             THEN /\ \/ /\ cs.status = RECONCILING \* \in {JOINING, RECONCILING}
-                                        /\ UpdateClientState(c, cs_stable)
-                                     \/ /\ cs.status \notin {JOINING, RECONCILING}
-                                        /\ UpdateClientState(c, cs1)
+                             THEN /\ IF cs.status \in {JOINING, RECONCILING}
+                                     THEN UpdateClientState(c, cs_stable)
+                                     ELSE UpdateClientState(c, cs1)
                                   /\ UNCHANGED client_recon_proc
                              ELSE Reconcile(c, cs1, m)
                         ELSE UpdateClientState(c, cs1)
@@ -506,18 +505,18 @@ BuildAssignment(partitions, updated_members, new_epoch) ==
 
 CreateNewAssignment(mid, updated_member, new_epoch) ==
     LET updated_members == UpdatedGroupMemberState(mid, updated_member)
-        partitions == TopicPartitions
+        partitions == SubscriptionPartitions
     IN BuildAssignment(partitions, updated_members, new_epoch)
 
 RemoveOldAddNew(old_partitions, new_partitions, p_epochs, updated_member) ==
     LET p_epochs1  == IF old_partitions /= new_partitions
-                      THEN [p \in TopicPartitions |->
+                      THEN [p \in SubscriptionPartitions |->
                                IF p \in old_partitions
                                THEN 0
                                ELSE p_epochs[p]]
                       ELSE p_epochs
         p_epochs2  == IF old_partitions /= new_partitions
-                      THEN [p \in TopicPartitions |->
+                      THEN [p \in SubscriptionPartitions |->
                                IF p \in new_partitions
                                THEN updated_member.member_epoch
                                ELSE p_epochs1[p]]
@@ -527,7 +526,7 @@ RemoveOldAddNew(old_partitions, new_partitions, p_epochs, updated_member) ==
 MaybeUpdatePartitionEpochs(mid, updated_member) ==
     IF mid \notin group_members
     THEN group_partition_epoch' = 
-                    [p \in TopicPartitions |->
+                    [p \in SubscriptionPartitions |->
                         IF \/ p \in updated_member.assigned_partitions
                            \/ p \in updated_member.revoked_partitions
                         THEN updated_member.member_epoch
@@ -617,7 +616,6 @@ FenceMember(mid) ==
         new_members       == group_members \ {mid}
         new_group_epoch   == group_epoch + 1
         new_members_state == [mid1 \in new_members |-> group_member_state[mid1]]
-                                    
     IN /\ group_members' = new_members
        /\ group_epoch' = new_group_epoch
        /\ group_member_state' = new_members_state
@@ -763,14 +761,14 @@ LiveMemberExpired(c) ==
 ValidGroupAssignment(assignment) ==
     /\ assignment.epoch \in Nat
     /\ \A mid \in DOMAIN assignment.assignments :
-        assignment.assignments[mid] \in SUBSET TopicPartitions
+        assignment.assignments[mid] \in SUBSET SubscriptionPartitions
 
 TypeOK ==
     /\ \A mid \in DOMAIN group_member_state : group_member_state[mid] \in GroupMemberState
     /\ group_epoch \in Nat
     /\ group_target_assignment.epoch \in Nat
     /\ ValidGroupAssignment(group_target_assignment)
-    /\ group_partition_epoch \in [TopicPartitions -> Nat]
+    /\ group_partition_epoch \in [SubscriptionPartitions -> Nat]
     /\ group_status \in GroupStatuses
     /\ client_state \in [Clients -> ClientState]
     /\ client_recon_proc \in [Clients -> ReconcileProcess \union {Nil}]
@@ -778,60 +776,49 @@ TypeOK ==
     /\ aux_member_id \in Nat
     /\ aux_fencing_ctr \in Nat
 
-\* INV: AllPartitionsAssigned
-\* A target assignment cannot leave out any partitions of the group subscription
-AllPartitionsAssigned ==
+\* INV: LegalTargetAssignment
+\* A target assignment cannot leave out any partitions of the
+\* group subscription and cannot assign any partition twice (to
+\* different members).
+LegalTargetAssignment ==
     \/ group_target_assignment.assignments = <<>>
     \/ /\ group_target_assignment.assignments /= <<>>
-       /\ \A p \in TopicPartitions :
-           \E c \in DOMAIN group_target_assignment.assignments :
-               p \in group_target_assignment.assignments[c]
-               
-\* INV: NoDoubleTargetAssignment
-\* No partition can be assigned to more than one member
-NoDoubleTargetAssignment ==
-    \/ group_target_assignment.assignments = <<>>
-    \/ /\ group_target_assignment.assignments /= <<>>
-       /\ \A p \in TopicPartitions :
-           ~\E mid1, mid2 \in DOMAIN group_target_assignment.assignments :
+       /\ \A p \in SubscriptionPartitions :
+           \* the partition is assigned
+           /\ \E mid \in DOMAIN group_target_assignment.assignments :
+               p \in group_target_assignment.assignments[mid]
+           \* the partition is only assigned to a single member
+           /\ ~\E mid1, mid2 \in DOMAIN group_target_assignment.assignments :
                 /\ mid1 /= mid2
                 /\ p \in group_target_assignment.assignments[mid1]
-                /\ p \in group_target_assignment.assignments[mid2]               
-
+                /\ p \in group_target_assignment.assignments[mid2]    
+               
 \* INV: NoDoubleClientAssignment
-\* No two clients, which are current group members, can both believe
-\* they are assigned the same partition.
+\* This is the most important safety property. No two clients,
+\* which are current group members, can both believe they are
+\* assigned the same partition.
 NoDoubleClientAssignment ==
     ~\E c1, c2 \in DOMAIN client_state :
         /\ c1 /= c2
         /\ client_state[c1].member_id \in group_members
         /\ client_state[c2].member_id \in group_members
-        /\ \E p \in TopicPartitions : 
+        /\ \E p \in SubscriptionPartitions : 
             /\ p \in client_state[c1].curr_assignment
             /\ p \in client_state[c2].curr_assignment
 
-ConsistentClient ==
-    \A c \in Clients :
-        LET cs  == client_state[c]
-            mid == cs.member_id
-            target_epoch == group_target_assignment.epoch
-            target_assignment == group_target_assignment.assignments[mid]
-        IN
-            (/\ cs.status = STABLE
-             /\ cs.member_epoch = target_epoch) => 
-                    (cs.curr_assignment = target_assignment)
-
 \* INV: ValidMemberEpoch
-\* A member cannot have reached the group epoch if it has
-\* partitions to revoke.
+\* A member cannot have reached the target epoch if it has
+\* partitions that are assigned to another member. Once a member
+\* reaches the target epoch, it is guaranteed to have committed
+\* all offsets of any previously assigned partitions (if any).
 ValidMemberEpoch ==
-    /\ ~\E mid \in group_members :
-        /\ group_member_state[mid].member_epoch = group_epoch
-        /\ group_member_state[mid].revoked_partitions /= {}
-    /\ ~\E c \in Clients :
-        /\ client_state[c].member_epoch = group_epoch
-        /\ client_state[c].member_id \in group_members
-        /\ group_member_state[client_state[c].member_id].revoked_partitions /= {}
+    \A c \in Clients :
+        (client_state[c].member_epoch = group_target_assignment.epoch)
+            => \* implies that
+                (~\E p \in client_state[c].curr_assignment :
+                    \E mid \in DOMAIN group_target_assignment.assignments :
+                        /\ client_state[c].member_id /= mid
+                        /\ p \in group_target_assignment.assignments[mid])
         
 \* INV: ValidReconcileState
 \* TODO: check this, it is not true
@@ -839,14 +826,8 @@ ValidReconcileState ==
     \A c \in Clients :
         client_state[c].status = RECONCILING => client_recon_proc[c] /= Nil 
 
-\* INV: ValidLeaveState
-\* When in PREPARE_LEAVING, there must be a leave process
-ValidLeaveState ==
-    \A c \in Clients :
-        client_state[c].status = PREPARE_LEAVING => client_leave_proc[c] /= Nil
-
 \* INV: ValidStableGroupState
-\* If the group state is STABLE, this implies that all group members:
+\* If the group status is STABLE, this implies that all group members:
 \* 1. Have status=STABLE.
 \* 2. Have a member epoch the matches the group epoch.
 \* 3. Have no revoked partitions. 
@@ -861,7 +842,10 @@ ValidStableGroupState ==
 
 \* for debugging. Set to TRUE to disable it.
 TestInv ==
-    TRUE
+    ~\E c \in Clients :
+        /\ client_recon_proc[c] /= Nil
+        /\ client_state[c].member_epoch = client_recon_proc[c].epoch_on_start
+        /\ client_recon_proc[c].assignment /= client_state[c].assignment_to_reconcile
 \*    TLCGet("level") < 70
 
 \* LIVENESS -------------------------------------
@@ -874,14 +858,37 @@ TestInv ==
 EventuallyConverges ==
     ~Converged ~> Converged
 
-\* LIVENESS: MemberEpochIsMonotonic
+
+\* ACTION PROPERTIES------------------------------
+\* Check that state transitions are legal.
+
+\* ACTION_PROP: ClientSideMemberEpochIsMonotonic
 \* A client's member epoch can only decrease if it
 \* gets set to the joining or leaving value.
-MemberEpochIsMonotonic ==
-    \A c \in Clients :
-        [][client_state[c]' /= client_state[c] 
-            => \/ client_state[c]'.member_epoch <= 0
-               \/ client_state[c]'.member_epoch >= client_state[c].member_epoch]_vars
+ClientSideMemberEpochIsMonotonic ==
+    [][\A c \in Clients :
+            client_state[c]' /= client_state[c] 
+                => \/ client_state[c]'.member_epoch <= 0
+                   \/ client_state[c]'.member_epoch >= client_state[c].member_epoch]_vars
+
+\* ACTION_PROP: GcSideMemberEpochIsMonotonic
+\* A member's member epoch cannot decrease.
+MemberUpdated(c) ==
+    LET mid == client_state[c].member_id
+    IN /\ mid > 0
+       /\ mid' > 0
+       /\ mid \in group_members
+       /\ mid \in group_members'
+       /\ group_member_state[mid]' /= group_member_state[mid]
+       
+MonotonicEpoch(c) ==
+    LET mid == client_state[c].member_id
+    IN group_member_state[mid]'.member_epoch >= 
+            group_member_state[mid].member_epoch           
+               
+GcSideMemberEpochIsMonotonic ==
+    [][\A c \in Clients :
+        MemberUpdated(c) => MonotonicEpoch(c)]_vars               
 
 \* for debugging. Set to TRUE to disable it.
 TestLiveness ==
@@ -913,7 +920,7 @@ Init ==
     /\ group_status = EMPTY
     /\ group_target_assignment = [epoch |-> 0,
                                   assignments |-> <<>>]
-    /\ group_partition_epoch = [p \in TopicPartitions |-> 0]
+    /\ group_partition_epoch = [p \in SubscriptionPartitions |-> 0]
     /\ client_state = [c \in Clients |->
                            [host |-> c,
                             connection_id |-> 0,
