@@ -1,8 +1,15 @@
 --------------------------- MODULE kip_966_properties ---------------------------
 EXTENDS FiniteSets, FiniteSetsExt, Sequences, SequencesExt, Integers, TLC,
-        message_passing,
+        network,
         kip_966_types,
         kip_966_functions
+
+Converged(leader, follower) ==
+\*    /\ broker_state[b1].
+    /\ partition_data[leader].leo = partition_data[follower].leo
+    /\ partition_data[leader].hwm = partition_data[follower].hwm
+    /\ partition_replica_state[leader][follower].leo = partition_data[follower].leo
+    /\ partition_replica_state[leader][follower].broker_epoch = broker_state[follower].broker_epoch
 
 \* ===============================================================
 \* INVARIANTS
@@ -282,7 +289,10 @@ EventuallyMetadataConverges ==
             \* (this spec reduces state space by pausing metadata replication when no relevant unreplicated records exist)
             \/ /\ partition_status[b] = Follower
                /\ ~\E md_offset \in UnreplicatedOffsets(b) :
-                    PartitionNeedsAction(b, md_offset))
+                    PartitionNeedsAction(b, md_offset)
+            \* or this replica got removed from the replica set
+            \/ /\ partition_status[b] = Nil
+               /\ b \notin con_partition_metadata.replicas)
                     
 
 \* LIVENESS: EventuallyWriteIsAcceptedOrRejected

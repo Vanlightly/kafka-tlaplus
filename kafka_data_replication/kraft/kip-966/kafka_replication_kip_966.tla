@@ -1,7 +1,7 @@
 -------------------------- MODULE kafka_replication_kip_966 --------------------------
 
 EXTENDS Naturals, FiniteSets, FiniteSetsExt, Sequences, SequencesExt, TLC, 
-        message_passing, 
+        network, 
         kip_966_types,
         kip_966_properties,
         kip_966_functions
@@ -29,8 +29,8 @@ Jump to the bottom of the spec for the Next state formula which lists all
 the actions.
 *)
 
-vars == << con_vars, broker_vars, part_vars, messages, inv_vars, aux_vars >>
-view == << con_vars, broker_vars, part_vars, messages, inv_vars >>
+vars == << con_vars, broker_vars, part_vars, NetworkVars, inv_vars, aux_vars >>
+view == << con_vars, broker_vars, part_vars, NetworkView, inv_vars >>
 
 \* ==================================================================
 \*              ACTIONS
@@ -64,23 +64,22 @@ SendBrokerRegistration(b) ==
     \* increment the auxilliary incarnation counter to ensure unique incarnation ids
     /\ aux_ctrs' = [aux_ctrs EXCEPT !.incarn_ctr = @ + 1]
 
-BrokerStart ==
-    \E b \in Brokers :
-        \* enabling conditions
-        /\ broker_state[b].status \in { OFFLINE_CLEAN, OFFLINE_DIRTY }
-        \* state mutations
-        /\ broker_state' = [broker_state EXCEPT ![b] = 
-                                [status            |-> STARTING,
-                                 \* PROPOSAL CHANGE - use the broker epoch on file
-                                 broker_epoch      |-> broker_state[b].broker_epoch,
-                                 incarnation_id    |-> aux_ctrs.incarn_ctr,
-                                 registered        |-> FALSE]]
-        /\ partition_status' = [partition_status EXCEPT ![b] = Nil]
-        /\ SendBrokerRegistration(b)
-        /\ UNCHANGED << con_vars, broker_fetchers, broker_metadata_log, 
-                        partition_metadata, partition_data, partition_leso,
-                        partition_replica_state, partition_pending_ap, 
-                        inv_vars, aux_broker_epoch >>        
+BrokerStart(b) ==
+    \* enabling conditions
+    /\ broker_state[b].status \in { OFFLINE_CLEAN, OFFLINE_DIRTY }
+    \* state mutations
+    /\ broker_state' = [broker_state EXCEPT ![b] = 
+                            [status            |-> STARTING,
+                             \* PROPOSAL CHANGE - use the broker epoch on file
+                             broker_epoch      |-> broker_state[b].broker_epoch,
+                             incarnation_id    |-> aux_ctrs.incarn_ctr,
+                             registered        |-> FALSE]]
+    /\ partition_status' = [partition_status EXCEPT ![b] = Nil]
+    /\ SendBrokerRegistration(b)
+    /\ UNCHANGED << con_vars, broker_fetchers, broker_metadata_log, 
+                    partition_metadata, partition_data, partition_leso,
+                    partition_replica_state, partition_pending_ap, 
+                    inv_vars, aux_broker_epoch, aux_flo >>        
 
 (* ---------------------------------------------------------------
    ACTION: ReceiveBrokerRegRequest
@@ -128,17 +127,17 @@ ProcessUncleanBroker(b) ==
     IN /\ MaybeUpdatePartitionOnBrokerChange(new_isr, new_elr, new_unfenced)
        /\ con_unfenced' = new_unfenced
 
-ReceiveBrokerRegRequest ==
-    \E m \in DOMAIN messages :
+ReceiveBrokerRegRequest(b) ==
+    \E m \in Messages :
         \* enabling conditions
-        /\ ReceivableMsg(m, RegisterBrokerRequest)
-        /\ \/ con_broker_reg[m.source].status = FENCED
-           \/ /\ con_broker_reg[m.source].status # FENCED
-              /\ con_broker_reg[m.source].incarnation_id = m.incarnation_id
+        /\ m.type = RegisterBrokerRequest
+        /\ b = m.source
+        /\ \/ con_broker_reg[b].status = FENCED
+           \/ /\ con_broker_reg[b].status # FENCED
+              /\ con_broker_reg[b].incarnation_id = m.incarnation_id
         \* state mutations
-        /\ LET b              == m.source
-               broker_epoch   == aux_broker_epoch + 1
-            IN
+        /\ LET broker_epoch   == aux_broker_epoch + 1
+           IN
                 /\ IF m.broker_epoch = 0 \* AND a registration exists
                    THEN ProcessUncleanBroker(b)
                    ELSE HandleBrokerUnfenced(b)
@@ -154,7 +153,7 @@ ReceiveBrokerRegRequest ==
                          dest            |-> b,
                          source          |-> Controller])
                 /\ aux_broker_epoch' = aux_broker_epoch + 1 \* used instead of metadata write offset
-                /\ UNCHANGED << broker_vars, part_vars, inv_vars, aux_ctrs >>
+                /\ UNCHANGED << broker_vars, part_vars, inv_vars, aux_ctrs, aux_flo >>
 
 (*---------------------------------------------------------------
   ACTION: ReceiveBrokerRegResponse
@@ -188,20 +187,21 @@ __CatchUpBarOne(b, m) ==
     IN /\ broker_metadata_log' = [broker_metadata_log EXCEPT ![b] = log]
        /\ partition_metadata' = [partition_metadata EXCEPT ![b] = BlankMetadata] 
 
-ReceiveBrokerRegResponse ==
-    \E m \in DOMAIN messages :
+ReceiveBrokerRegResponse(b) ==
+    \E m \in Messages :
         \* enabling conditions
-        /\ ReceivableMsg(m, RegisterBrokerResponse)
-        /\ broker_state[m.dest].status = STARTING
-        /\ broker_state[m.dest].registered = FALSE
-        /\ broker_state[m.dest].incarnation_id = m.incarnation_id \* CHECK
+        /\ m.type = RegisterBrokerResponse
+        /\ b = m.dest
+        /\ broker_state[b].status = STARTING
+        /\ broker_state[b].registered = FALSE
+        /\ broker_state[b].incarnation_id = m.incarnation_id \* CHECK
         \* state mutations
-        /\ broker_state' = [broker_state EXCEPT ![m.dest] = 
+        /\ broker_state' = [broker_state EXCEPT ![b] = 
                                 [status         |-> RUNNING,
                                  broker_epoch   |-> m.broker_epoch,
-                                 incarnation_id |-> broker_state[m.dest].incarnation_id,
+                                 incarnation_id |-> broker_state[b].incarnation_id,
                                  registered     |-> TRUE]]
-        /\ __CatchUpBarOne(m.dest, m)
+        /\ __CatchUpBarOne(b, m)
         /\ Discard(m)
         /\ UNCHANGED << con_vars, broker_fetchers, partition_status, partition_data,  
                         partition_leso, partition_replica_state, partition_pending_ap, 
@@ -230,16 +230,15 @@ ReceiveBrokerRegResponse ==
   that heartbeats can be received without actually modeling them.
 ---------------------------------------------------------------------*)
 
-UnfenceBroker ==
+UnfenceBroker(b) ==
     \* enabling conditions
-    \E b \in Brokers :
-        /\ con_broker_reg[b].status = FENCED
-        /\ broker_state[b].status = RUNNING
-        \* state mutations
-        /\ HandleBrokerUnfenced(b)
-        /\ con_broker_reg' = [con_broker_reg EXCEPT ![b].status = UNFENCED]
-        /\ UNCHANGED << broker_vars, part_vars, messages, inv_vars, 
-                        aux_vars >>
+    /\ con_broker_reg[b].status = FENCED
+    /\ broker_state[b].status = RUNNING
+    \* state mutations
+    /\ HandleBrokerUnfenced(b)
+    /\ con_broker_reg' = [con_broker_reg EXCEPT ![b].status = UNFENCED]
+    /\ UNCHANGED << broker_vars, part_vars, NetworkVars, inv_vars, 
+                    aux_vars >>
 
 (*--------------------------------------------------------------------
   ACTION: FenceBroker
@@ -256,17 +255,16 @@ UnfenceBroker ==
   ++++++++++++++++++++++++++++++++++++++++++++++++
 ---------------------------------------------------------------------*)
 
-FenceBroker ==
+FenceBroker(b) ==
     \* enabling conditions
     /\ aux_ctrs.fence_broker_ctr < FenceBrokerLimit
-    /\ \E b \in Brokers :
-        /\ con_broker_reg[b].status = UNFENCED
-        \* state mutations
-        /\ HandleBrokerFenced(b)
-        /\ con_broker_reg' = [con_broker_reg EXCEPT ![b].status = FENCED]
-        /\ aux_ctrs' = [aux_ctrs EXCEPT !.fence_broker_ctr = @ + 1]
-        /\ UNCHANGED << broker_vars, part_vars, messages, inv_vars,
-                        aux_broker_epoch >>
+    /\ con_broker_reg[b].status = UNFENCED
+    \* state mutations
+    /\ HandleBrokerFenced(b)
+    /\ con_broker_reg' = [con_broker_reg EXCEPT ![b].status = FENCED]
+    /\ aux_ctrs' = [aux_ctrs EXCEPT !.fence_broker_ctr = @ + 1]
+    /\ UNCHANGED << broker_vars, part_vars, NetworkVars, inv_vars,
+                    aux_broker_epoch, aux_flo >>
 
 (*-----------------------------------------------------------------------
   ACTION: ReceiveMetadataUpdate
@@ -361,7 +359,8 @@ NoFetcherChanges ==
 EnsureLeadershipRenounced(b, new_part_md) ==
     /\ MaybeFailPendingWrites(b, new_part_md)
     /\ ResetAllFollowerState(b)
-    /\ ResetPendingAlterPartition(b)    
+    /\ ResetPendingAlterPartition(b)
+    /\ ResetPendingAcks(b)    
 
 \* --- Sub-Action 1: RemainLeader ---
 \* The replica remains leader, all it must do is conditionally advance the HWM
@@ -373,7 +372,7 @@ RemainLeader(b, new_part_md) ==
        THEN ResetPendingAlterPartition(b)
        ELSE UNCHANGED partition_pending_ap
     /\ UNCHANGED << partition_status, partition_replica_state, 
-                    partition_leso, broker_fetchers>>
+                    partition_leso, broker_fetchers, aux_flo>>
 
 \* --- Sub-Action 2: BecomeLeaderInNewEpoch ---
 \* The replica has become a leader in a new leader epoch. This includes
@@ -397,6 +396,7 @@ BecomeLeaderInNewEpoch(b, new_part_md, is_new_leader) ==
             ResetFollowerStateOfAllButISR(b, new_part_md) \* CHECK
     /\ ResetPendingAlterPartition(b)
     /\ RemovePartitionFromFetchers(b)
+    /\ UNCHANGED aux_flo
 
 \* --- Sub-Action 3: RemainFollower ---
 \* The replica is still a follower in the same leader epoch. So do nothing.     
@@ -444,69 +444,69 @@ DeletePartition(b, new_part_md) ==
     /\ UNCHANGED << inv_true_hwm, inv_consumed >>    
 
 MetadataNoOp ==
-    UNCHANGED << part_vars, broker_fetchers, inv_vars >>
+    UNCHANGED << part_vars, broker_fetchers, inv_vars, aux_flo >>
 
-ReceiveMetadataUpdate ==
-    \E b \in Brokers :
-        \* enabling conditions
-        /\ broker_state[b].status \notin {OFFLINE_CLEAN, OFFLINE_DIRTY}
-        /\ broker_state[b].registered = TRUE
-        /\ \E md_offset \in UnreplicatedOffsets(b) :
-            /\ PartitionNeedsAction(b, md_offset)
-            /\ LET md_record      == con_metadata_log[md_offset]
-                   append_records == SubSeq(con_metadata_log, 
-                                            Len(broker_metadata_log[b])+1,
-                                            md_offset) 
-                   curr_part_md   == partition_metadata[b]
-                   new_part_md    == [replicas        |-> md_record.replicas,
-                                      isr             |-> md_record.isr,
-                                      maximal_isr     |-> md_record.isr,
-                                      leader          |-> md_record.leader,
-                                      leader_epoch    |-> md_record.leader_epoch,
-                                      partition_epoch |-> md_record.partition_epoch]
-                   is_new_leader  == /\ partition_status[b] # Leader
-                                     /\ md_record.leader = b
-               IN \* state mutations
-                  /\ broker_metadata_log' = [broker_metadata_log EXCEPT ![b] = @ \o append_records]
-                     \* The partition epoch may not always be higher as an AlterPartition response may have
-                     \* already have been received tht matches this epoch.
-                  /\ IF new_part_md.partition_epoch > curr_part_md.partition_epoch
-                     THEN
-                          /\ partition_metadata' = [partition_metadata EXCEPT ![b] = IF b \in new_part_md.replicas
-                                                                                     THEN new_part_md
-                                                                                     ELSE BlankMetadata]
-                          /\ CASE 
-                               \* CASE --- Delete partition locally ----------------------
-                                  /\ b \in partition_metadata[b].replicas
-                                  /\ b \notin new_part_md.replicas ->
-                                      DeletePartition(b, new_part_md)
-                               \* CASE --- Remains leader --------------------------------
-                               [] /\ partition_metadata[b].leader = b
-                                  /\ md_record.leader = b -> 
-                                      IF partition_metadata[b].leader_epoch = new_part_md.leader_epoch
-                                      THEN \* Remains leader in the same leader epoch
-                                           RemainLeader(b, new_part_md)
-                                      ELSE \* Leader reelected in a new leader epoch
-                                           BecomeLeaderInNewEpoch(b, new_part_md, is_new_leader)
-                               \* CASE --- Follower elected as leader----------------------
-                               [] /\ partition_metadata[b].leader # b
-                                  /\ md_record.leader = b ->
-                                      BecomeLeaderInNewEpoch(b, new_part_md, is_new_leader)
-                               \* CASE --- Chosen as a follower ---------------------------
-                               [] /\ b \in new_part_md.replicas
-                                  /\ md_record.leader # NoLeader ->
-                                      IF /\ new_part_md.leader_epoch = curr_part_md.leader_epoch
-                                         /\ curr_part_md.leader # b
-                                         /\ new_part_md.leader # b
-                                      THEN RemainFollower
-                                      ELSE BecomeFollowerInNewEpoch(b, new_part_md)
-                               \* CASE --- No leader chosen -------------------------------
-                               [] OTHER ->
-                                      /\ b \in new_part_md.replicas
-                                      /\ WaitForLeaderChange(b, new_part_md)
-                               \* END CASE
-                     ELSE MetadataNoOp
-                  /\ UNCHANGED << con_vars, broker_state, messages, aux_vars, inv_sent >>
+ReceiveMetadataUpdate(b) ==
+    \* enabling conditions
+    /\ broker_state[b].status \notin {OFFLINE_CLEAN, OFFLINE_DIRTY}
+    /\ broker_state[b].registered = TRUE
+    /\ \E md_offset \in UnreplicatedOffsets(b) :
+        /\ PartitionNeedsAction(b, md_offset)
+        /\ LET md_record      == con_metadata_log[md_offset]
+               append_records == SubSeq(con_metadata_log, 
+                                        Len(broker_metadata_log[b])+1,
+                                        md_offset) 
+               curr_part_md   == partition_metadata[b]
+               new_part_md    == [replicas        |-> md_record.replicas,
+                                  isr             |-> md_record.isr,
+                                  maximal_isr     |-> md_record.isr,
+                                  leader          |-> md_record.leader,
+                                  leader_epoch    |-> md_record.leader_epoch,
+                                  partition_epoch |-> md_record.partition_epoch]
+               is_new_leader  == /\ partition_status[b] # Leader
+                                 /\ md_record.leader = b
+           IN \* state mutations
+              /\ broker_metadata_log' = [broker_metadata_log EXCEPT ![b] = @ \o append_records]
+                 \* The partition epoch may not always be higher as an AlterPartition response may have
+                 \* already have been received tht matches this epoch.
+              /\ IF new_part_md.partition_epoch > curr_part_md.partition_epoch
+                 THEN
+                      /\ partition_metadata' = [partition_metadata EXCEPT ![b] = IF b \in new_part_md.replicas
+                                                                                 THEN new_part_md
+                                                                                 ELSE BlankMetadata]
+                      /\ CASE 
+                           \* CASE --- Delete partition locally ----------------------
+                              /\ b \in partition_metadata[b].replicas
+                              /\ b \notin new_part_md.replicas ->
+                                  DeletePartition(b, new_part_md)
+                           \* CASE --- Remains leader --------------------------------
+                           [] /\ partition_metadata[b].leader = b
+                              /\ md_record.leader = b -> 
+                                  IF partition_metadata[b].leader_epoch = new_part_md.leader_epoch
+                                  THEN \* Remains leader in the same leader epoch
+                                       RemainLeader(b, new_part_md)
+                                  ELSE \* Leader reelected in a new leader epoch
+                                       BecomeLeaderInNewEpoch(b, new_part_md, is_new_leader)
+                           \* CASE --- Follower elected as leader----------------------
+                           [] /\ partition_metadata[b].leader # b
+                              /\ md_record.leader = b ->
+                                  BecomeLeaderInNewEpoch(b, new_part_md, is_new_leader)
+                           \* CASE --- Chosen as a follower ---------------------------
+                           [] /\ b \in new_part_md.replicas
+                              /\ md_record.leader # NoLeader ->
+                                  IF /\ new_part_md.leader_epoch = curr_part_md.leader_epoch
+                                     /\ curr_part_md.leader # b
+                                     /\ new_part_md.leader # b
+                                  THEN RemainFollower
+                                  ELSE BecomeFollowerInNewEpoch(b, new_part_md)
+                           \* CASE --- No leader chosen -------------------------------
+                           [] OTHER ->
+                                  /\ b \in new_part_md.replicas
+                                  /\ WaitForLeaderChange(b, new_part_md)
+                           \* END CASE
+                 ELSE MetadataNoOp
+              /\ UNCHANGED << con_vars, broker_state, NetworkVars, aux_broker_epoch, 
+                              aux_ctrs, inv_sent >>
 
 (*--------------------------------------------------------------------------
   ACTION: SendAlterPartitionRequest
@@ -592,11 +592,14 @@ MaybeIncrementShrinkCtr(curr_isr, proposed_isr) ==
     THEN aux_ctrs' = [aux_ctrs EXCEPT !.leader_shrink_isr_ctr = @ + 1]
     ELSE UNCHANGED aux_ctrs
 
-\* if we've sent this exact request before then it got rejected previously
-\* so don't try to send it again else we'll enter an infinite cycle
-\* that prevents liveness checking
+\* This is a magic function to prevent a cycle which would prevent
+\* liveness checking. If we've sent this exact request before then
+\* make sure the controller won't reject it again (causing infinite
+\* retries).
 __AvoidCycle(ap_request) ==
-    ~\E m \in DOMAIN messages : ap_request = m 
+    \/ ~PreviouslySent(ap_request)
+    \/ /\ PreviouslySent(ap_request)
+       /\ ValidateAlterPartitionRequest(ap_request.source, ap_request) = Nil \* Nil means no error
 
 DoSendAlterPartitionRequest(b, timed_out_isr) ==
     /\ b \notin timed_out_isr
@@ -624,20 +627,19 @@ DoSendAlterPartitionRequest(b, timed_out_isr) ==
           /\ MaybeIncrementShrinkCtr(curr_isr, proposed_isr)
           /\ UNCHANGED << con_vars, broker_vars, partition_data, partition_leso, 
                           partition_replica_state, partition_status, inv_vars,
-                          aux_broker_epoch >>
+                          aux_broker_epoch, aux_flo >>
 
-SendAlterPartitionRequest ==
+SendAlterPartitionRequest(b) ==
     \* enabling conditions
-    \E b \in Brokers :
-        /\ broker_state[b].status = RUNNING
-        /\ ~PendingAlterPartitionResponse(b)
-        /\ partition_status[b] = Leader
-        /\ IF aux_ctrs.leader_shrink_isr_ctr < LeaderShrinkIsrLimit
-           THEN \E timed_out_isr \in SUBSET partition_metadata[b].isr :
-                    /\ Cardinality(timed_out_isr) > 0
-                    /\ b \notin timed_out_isr
-                    /\ DoSendAlterPartitionRequest(b, timed_out_isr)
-           ELSE DoSendAlterPartitionRequest(b, {})
+    /\ broker_state[b].status = RUNNING
+    /\ ~PendingAlterPartitionResponse(b)
+    /\ partition_status[b] = Leader
+    \* state mutations
+    /\ IF aux_ctrs.leader_shrink_isr_ctr < LeaderShrinkIsrLimit
+       THEN \E timed_out_isr \in SUBSET partition_metadata[b].isr :
+                /\ b \notin timed_out_isr
+                /\ DoSendAlterPartitionRequest(b, timed_out_isr)
+       ELSE DoSendAlterPartitionRequest(b, {})
 
 (*--------------------------------------------------------------------------
   ACTION: ReceiveAlterPartitionRequest
@@ -687,31 +689,13 @@ SendAlterPartitionRequest ==
   ++++++++++++++++++++++++++++++++++++++++++++++++++++   
 ---------------------------------------------------------------------------*)
 
-IsEligibleBroker(b, broker_epoch) ==
-    /\ con_broker_reg[b].status = UNFENCED
-    /\ \/ broker_epoch = 0                                  \* CHECK
-       \/ con_broker_reg[b].broker_epoch = broker_epoch
-    
-EligibleIsr(m) ==
-    \A b \in DOMAIN m.isr_and_epochs :
-        IsEligibleBroker(b, m.isr_and_epochs[b])    
-
-ValidateRequest(b, m) ==
-    IF /\ b = con_partition_metadata.leader
-       /\ m.broker_epoch = con_broker_reg[b].broker_epoch               
-       /\ m.partition_epoch = con_partition_metadata.partition_epoch    \* CHECK
-    THEN IF EligibleIsr(m)
-         THEN Nil
-         ELSE IneligibleReplica
-    ELSE FencedLeaderEpoch
-
-ReceiveAlterPartitionRequest ==
-    \E m \in DOMAIN messages : 
+ReceiveAlterPartitionRequest(b) ==
+    \E m \in Messages : 
         \* enabling conditions
-        /\ ReceivableMsg(m, AlterPartitionRequest)
-        /\ LET b     == m.source
-               md    == con_partition_metadata
-               error == ValidateRequest(b, m)
+        /\ m.type = AlterPartitionRequest
+        /\ b = m.source
+        /\ LET md    == con_partition_metadata
+               error == ValidateAlterPartitionRequest(b, m)
                final_replicas == md.replicas \ md.removing
                final_isr      == m.isr \ md.removing
                complete       == /\ ReassignmentInProgress
@@ -812,32 +796,30 @@ RollbackPartitionChange(b) ==
                                     partition_metadata[b].isr]                      
     IN CommitPartitionChange(b, last_part_state)
 
-ReceiveAlterPartitionResponse ==
-    \E m \in DOMAIN messages : 
+ReceiveAlterPartitionResponse(b) ==
+    \E m \in Messages : 
         \* enabling conditions
-        /\ ReceivableMsg(m, AlterPartitionResponse)
-        /\ LET b == m.dest
-           IN
-              /\ broker_state[b].status = RUNNING
-              /\ partition_status[b] = Leader
-              /\ PendingAlterPartitionResponse(b)
-              /\ partition_pending_ap[b].request = m.request \* correlates to our request
-              /\ IF m.error = Nil
-                 THEN \* Not a stale partition epoch
-                      /\ m.partition_epoch > partition_metadata[b].partition_epoch
-                      \* The request could have completed a reassignment, bumping the leader
-                      \* epoch, in that case ignore this response and wait for the metadata update instead.
-                      /\ m.leader_epoch = partition_metadata[b].leader_epoch
-                 ELSE TRUE
-              \* state mutations
-              /\ IF m.error = Nil
-                 THEN CompletePartitionChange(b, m)
-                 ELSE RollbackPartitionChange(b)
-              /\ ResetPendingAlterPartition(b)
-              /\ Discard(m)
-        /\ UNCHANGED << con_vars, broker_vars, partition_status, partition_leso,
-                        partition_replica_state, aux_vars >>
-
+        /\ m.type = AlterPartitionResponse
+        /\ b = m.dest
+        /\ broker_state[b].status = RUNNING
+        /\ partition_status[b] = Leader
+        /\ PendingAlterPartitionResponse(b)
+        /\ partition_pending_ap[b].request = m.request \* correlates to our request
+        /\ IF m.error = Nil
+           THEN \* Not a stale partition epoch
+                /\ m.partition_epoch > partition_metadata[b].partition_epoch
+                \* The request could have completed a reassignment, bumping the leader
+                \* epoch, in that case ignore this response and wait for the metadata update instead.
+                /\ m.leader_epoch = partition_metadata[b].leader_epoch
+           ELSE TRUE
+        \* state mutations
+        /\ IF m.error = Nil
+           THEN CompletePartitionChange(b, m)
+           ELSE RollbackPartitionChange(b)
+        /\ ResetPendingAlterPartition(b)
+        /\ Discard(m)
+        /\ UNCHANGED << con_vars, broker_vars, partition_status, 
+                        partition_leso, partition_replica_state, aux_vars >>
 
 (*--------------------------------------------------------------------------
   ACTION: PerformPartitionReassignment
@@ -919,7 +901,7 @@ PerformPartitionReassignment ==
                                             new_md.removing)
     /\ aux_ctrs' = [aux_ctrs EXCEPT !.reassignment_ctr = @ + 1]
     /\ UNCHANGED << con_broker_reg, con_unfenced, broker_vars, 
-                    part_vars, aux_broker_epoch, inv_vars, messages >>
+                    part_vars, aux_broker_epoch, aux_flo, inv_vars, NetworkVars >>
 
 (*-----------------------------------------------------------------------
   ACTION: SendFetchRequest
@@ -940,8 +922,8 @@ PerformPartitionReassignment ==
   NO PROPOSAL CHANGE
 ---------------------------------------------------------------------*)
 
-SendFetchRequest ==
-    \E from, to \in Brokers :
+SendFetchRequest(from) ==
+    \E to \in Brokers :
         \* enabling conditions
         /\ from # to
         /\ broker_state[from].status = RUNNING
@@ -949,7 +931,8 @@ SendFetchRequest ==
         /\ Fetcher(from, to).pending_response = FALSE  \* The fetcher is not waiting for a response
         /\ partition_metadata[from].leader = to        \* This replica believes the destination 
                                                        \* broker hosts the leader replica
-        /\ __SendFetchMakesProgress(from) \* prevents infinite cycles
+        /\ ~Converged(to, from)
+\*        /\ __SendFetchMakesProgress(from) \* prevents infinite cycles
         \* state mutations
         /\ Send([type               |-> FetchRequest,
                  broker_epoch       |-> broker_state[from].broker_epoch,
@@ -1023,13 +1006,13 @@ SendFetchRequest ==
   +++++++++++++++++++++++++++++++++++++++++++++++++++++++
 ---------------------------------------------------------------------*)  
 
-ReceiveFetchRequest ==
-    \E m \in DOMAIN messages :
+ReceiveFetchRequest(b) ==
+    \E m \in Messages :
         \* enabling conditions
-        /\ ReceivableMsg(m, FetchRequest)
-        /\ __ReceiveFetchMakesProgress(m)
-        /\ LET b          == m.dest
-               last_epoch == LastOffsetForEpoch(b, m.partition.last_fetched_epoch, TRUE)
+        /\ m.type = FetchRequest
+\*        /\ __ReceiveFetchMakesProgress(m)
+        /\ b = m.dest
+        /\ LET last_epoch == LastOffsetForEpoch(b, m.partition.last_fetched_epoch, TRUE)
            IN
               /\ broker_state[b].status = RUNNING
               \* state mutations
@@ -1151,74 +1134,73 @@ TruncateToSafePoint(b, diverging_epoch) ==
 FetcherHasPartition(b, leader) ==
     broker_fetchers[b][leader].partition # Nil
 
-ReceiveFetchResponse ==
-    \E m \in DOMAIN messages :
+ReceiveFetchResponse(b) ==
+    \E m \in Messages :
         \* enabling conditions
-        /\ ReceivableMsg(m, FetchResponse)
-        /\ LET b       == m.dest
-           IN
-              /\ broker_state[b].status = RUNNING
-              /\ Fetcher(b, m.source).pending_response = TRUE
-              \* state mutations
-              /\ CASE
-                   \* --- CASE NoOp ------------------------------------------
-                      \* The partition is not added to this fetcher 
-                      \* or the partition is added but the fetch offset or leader epoch doesn't match.
-                      \/ ~FetcherHasPartition(b, m.source)
-                      \/ /\ FetcherHasPartition(b, m.source)
-                         /\ \/ Fetcher(b, m.source).partition.fetch_offset # m.partition.fetch_offset \* CHECK
-                            \/ partition_metadata[b].leader_epoch # m.partition.leader_epoch ->       \* CHECK
-                          \* state mutations
-                          /\ broker_fetchers' = [broker_fetchers EXCEPT 
-                                                        ![b][m.source].pending_response = FALSE]
-                          /\ UNCHANGED << partition_status, partition_data >>
-                   \* --- CASE error -------------------------------------------------------
-                   [] m.partition.error # Nil ->
-                          \* state mutations
-                          /\ broker_fetchers' = [broker_fetchers EXCEPT 
-                                                        ![b][m.source].pending_response = FALSE,
-                                                        ![b][m.source].partition.delayed = TRUE]
-                          /\ UNCHANGED << partition_status, partition_data >> 
-                   \* --- CASE diverging epoch ---------------------------------------------
-                   [] m.partition.diverging_epoch # Nil ->
-                          \* the follower log has diverged, truncate the log and update fetch state
-                          LET after_trunc        == TruncateToSafePoint(b, m.partition.diverging_epoch)
-                              last_fetched_epoch == IF after_trunc.log = <<>>
-                                                    THEN 0
-                                                    ELSE Last(after_trunc.log).epoch
-                          IN  \* state mutations
-                              /\ partition_data' = [partition_data EXCEPT ![b] = after_trunc] 
-                              /\ broker_fetchers' = [broker_fetchers EXCEPT ![b][m.source] =  
-                                                            [partition |-> [fetch_offset       |-> after_trunc.leo,
-                                                                            last_fetched_epoch |-> last_fetched_epoch,
-                                                                            delayed            |-> FALSE],
-                                                             pending_response |-> FALSE]]
-                              /\ UNCHANGED << partition_status >>
-                   \* --- CASE OK -----------------------------------------------------------
-                   [] OTHER ->
-                          LET new_leo == Len(LogOf(b)) + Len(m.partition.records) + 1
-                              last_fetched_epoch == IF m.partition.records # <<>>
-                                                    THEN Last(m.partition.records).epoch
-                                                    ELSE Fetcher(b, m.source).partition.last_fetched_epoch
-                          IN
-                              \* state mutations
-                              /\ partition_data' = [partition_data EXCEPT ![b] =
-                                                        [log |-> LogOf(b) \o m.partition.records, \* append the new data
-                                                         leo |-> new_leo,
-                                                         \* just overwrite HWM as long as it falls within bounds of the log
-                                                         hwm |-> IF m.partition.hwm <= new_leo
-                                                                 THEN m.partition.hwm ELSE HwmOf(b)]]
-                              /\ broker_fetchers' = [broker_fetchers EXCEPT ![b][m.source] =  
-                                                            [partition |-> [fetch_offset       |-> new_leo,
-                                                                            last_fetched_epoch |-> last_fetched_epoch,
-                                                                            delayed            |-> FALSE],
-                                                             pending_response |-> FALSE]]
-                              /\ UNCHANGED << partition_status >>
-                  \* CASE END -----------------------------------------
-              /\ Discard(m)
-              /\ UNCHANGED << con_vars, broker_state, broker_metadata_log, partition_metadata, 
-                              partition_replica_state, partition_leso, partition_pending_ap,
-                              inv_vars, aux_vars >> 
+        /\ m.type = FetchResponse
+        /\ b = m.dest
+        /\ broker_state[b].status = RUNNING
+        /\ Fetcher(b, m.source).pending_response = TRUE
+        \* state mutations
+        /\ CASE
+             \* --- CASE NoOp ------------------------------------------
+                \* The partition is not added to this fetcher 
+                \* or the partition is added but the fetch offset or leader epoch doesn't match.
+                \/ ~FetcherHasPartition(b, m.source)
+                \/ /\ FetcherHasPartition(b, m.source)
+                   /\ \/ Fetcher(b, m.source).partition.fetch_offset # m.partition.fetch_offset \* CHECK
+                      \/ partition_metadata[b].leader_epoch # m.partition.leader_epoch ->       \* CHECK
+                    \* state mutations
+                    /\ broker_fetchers' = [broker_fetchers EXCEPT 
+                                                  ![b][m.source].pending_response = FALSE]
+                    /\ UNCHANGED << partition_status, partition_data >>
+             \* --- CASE error -------------------------------------------------------
+             [] m.partition.error # Nil ->
+                    \* state mutations
+                    /\ broker_fetchers' = [broker_fetchers EXCEPT 
+                                                  ![b][m.source].pending_response = FALSE,
+                                                  ![b][m.source].partition.delayed = TRUE]
+                    /\ UNCHANGED << partition_status, partition_data >> 
+             \* --- CASE diverging epoch ---------------------------------------------
+             [] m.partition.diverging_epoch # Nil ->
+                    \* the follower log has diverged, truncate the log and update fetch state
+                    LET after_trunc        == TruncateToSafePoint(b, m.partition.diverging_epoch)
+                        last_fetched_epoch == IF after_trunc.log = <<>>
+                                              THEN 0
+                                              ELSE Last(after_trunc.log).epoch
+                    IN  \* state mutations
+                        /\ partition_data' = [partition_data EXCEPT ![b] = after_trunc] 
+                        /\ broker_fetchers' = [broker_fetchers EXCEPT ![b][m.source] =  
+                                                      [partition |-> [fetch_offset       |-> after_trunc.leo,
+                                                                      last_fetched_epoch |-> last_fetched_epoch,
+                                                                      delayed            |-> FALSE],
+                                                       pending_response |-> FALSE]]
+                        /\ UNCHANGED << partition_status >>
+             \* --- CASE OK -----------------------------------------------------------
+             [] OTHER ->
+                    LET new_leo == Len(LogOf(b)) + Len(m.partition.records) + 1
+                        last_fetched_epoch == IF m.partition.records # <<>>
+                                              THEN Last(m.partition.records).epoch
+                                              ELSE Fetcher(b, m.source).partition.last_fetched_epoch
+                    IN
+                        \* state mutations
+                        /\ partition_data' = [partition_data EXCEPT ![b] =
+                                                  [log |-> LogOf(b) \o m.partition.records, \* append the new data
+                                                   leo |-> new_leo,
+                                                   \* just overwrite HWM as long as it falls within bounds of the log
+                                                   hwm |-> IF m.partition.hwm <= new_leo
+                                                           THEN m.partition.hwm ELSE HwmOf(b)]]
+                        /\ broker_fetchers' = [broker_fetchers EXCEPT ![b][m.source] =  
+                                                      [partition |-> [fetch_offset       |-> new_leo,
+                                                                      last_fetched_epoch |-> last_fetched_epoch,
+                                                                      delayed            |-> FALSE],
+                                                       pending_response |-> FALSE]]
+                        /\ UNCHANGED << partition_status >>
+            \* CASE END -----------------------------------------
+        /\ Discard(m)
+        /\ UNCHANGED << con_vars, broker_state, broker_metadata_log, partition_metadata, 
+                        partition_replica_state, partition_leso, partition_pending_ap,
+                        inv_vars, aux_vars >> 
 
 (*--------------------------------------------------------------
   ACTION: WriteRecordToLeader
@@ -1240,8 +1222,8 @@ ReceiveFetchResponse ==
   +++++++++++++++++++++++++++++++++++++++++++++++++++++++
 ---------------------------------------------------------------------*)  
 
-WriteRecordToLeader ==
-    \E b \in Brokers, v \in Values :
+WriteRecordToLeader(b) ==
+    \E v \in Values :
         \* enabling conditions
         /\ v \notin inv_sent \* this value has not yet been written
         /\ broker_state[b].status = RUNNING
@@ -1269,8 +1251,12 @@ WriteRecordToLeader ==
                  THEN UpdateHwmInvariantVars(b, old_hwm, new_hwm, TRUE)
                  ELSE UNCHANGED << inv_pos_acked, inv_neg_acked, inv_true_hwm, inv_consumed >>
               /\ inv_sent' = inv_sent \union {v}
+              /\ IF aux_flo[b] = IntMax
+                 THEN aux_flo' = [aux_flo EXCEPT ![b] = LeoOf(b)]
+                 ELSE UNCHANGED aux_flo
               /\ UNCHANGED << con_vars, broker_vars, partition_metadata, partition_status, partition_leso,
-                              partition_replica_state, partition_pending_ap, messages, aux_vars >>
+                              partition_replica_state, partition_pending_ap, NetworkVars,
+                              aux_broker_epoch, aux_ctrs>>
 
 (*-----------------------------------------------------------------------
   ACTION: DataLossShutdown
@@ -1287,33 +1273,33 @@ FailPendingWritesIfLeader(b) ==
     THEN FailPendingWrites(b)
     ELSE UNCHANGED << inv_pos_acked, inv_neg_acked >>
 
-DataLossShutdown ==
+DataLossShutdown(b) ==
     \* enabling conditions
     /\ aux_ctrs.data_loss_shutdown_ctr < DataLossShutdownLimit
-    /\ \E b \in Brokers :
-        /\ broker_state[b].status \notin { OFFLINE_CLEAN, OFFLINE_DIRTY }
-        \* state mutations
-        /\ broker_state' = [broker_state EXCEPT ![b] = 
-                                [status            |-> OFFLINE_DIRTY,
-                                 broker_epoch      |-> 0,
-                                 incarnation_id    |-> 0,
-                                 registered        |-> FALSE]]
-        /\ DropFetchSessions(b)
-        /\ partition_status' = [partition_status EXCEPT ![b] = Nil]
-        /\ partition_data' = [partition_data EXCEPT ![b] = 
-                                        [log |-> <<>>, hwm |-> 1, leo |-> 1]]
-        /\ partition_leso' = [partition_leso EXCEPT ![b] = Nil]
-        /\ partition_replica_state' = [partition_replica_state EXCEPT ![b] = 
-                                        [b1 \in Brokers |-> 
-                                            BlankReplicaState]]
-        /\ ResetPendingAlterPartition(b)
-        /\ aux_ctrs' = [aux_ctrs EXCEPT !.data_loss_shutdown_ctr = @ + 1]
-        /\ FailPendingWritesIfLeader(b)
-        \* make the controller detect it
-        /\ HandleBrokerFenced(b)
-        /\ con_broker_reg' = [con_broker_reg EXCEPT ![b].status = FENCED]
-        /\ UNCHANGED << partition_metadata, broker_metadata_log, inv_true_hwm,
-                        inv_consumed, inv_sent, aux_broker_epoch >>
+    /\ broker_state[b].status \notin { OFFLINE_CLEAN, OFFLINE_DIRTY }
+    \* state mutations
+    /\ broker_state' = [broker_state EXCEPT ![b] = 
+                            [status            |-> OFFLINE_DIRTY,
+                             broker_epoch      |-> 0,
+                             incarnation_id    |-> 0,
+                             registered        |-> FALSE]]
+    /\ DropFetchSessions(b)
+    /\ partition_status' = [partition_status EXCEPT ![b] = Nil]
+    /\ partition_data' = [partition_data EXCEPT ![b] = 
+                                    [log |-> <<>>, hwm |-> 1, leo |-> 1]]
+    /\ partition_leso' = [partition_leso EXCEPT ![b] = Nil]
+    /\ partition_replica_state' = [partition_replica_state EXCEPT ![b] = 
+                                    [b1 \in Brokers |-> 
+                                        BlankReplicaState]]
+    /\ ResetPendingAlterPartition(b)
+    /\ aux_ctrs' = [aux_ctrs EXCEPT !.data_loss_shutdown_ctr = @ + 1]
+    /\ FailPendingWritesIfLeader(b)
+    \* make the controller detect it
+    /\ HandleBrokerFenced(b)
+    /\ con_broker_reg' = [con_broker_reg EXCEPT ![b].status = FENCED]
+    /\ ResetPendingAcks(b)
+    /\ UNCHANGED << partition_metadata, broker_metadata_log, inv_true_hwm,
+                    inv_consumed, inv_sent, aux_broker_epoch >>
                         
 (*-----------------------------------------------------------------------
   ACTION: NoDataLossShutdown
@@ -1332,10 +1318,10 @@ DataLossShutdown ==
   +++++++++++++++++++++++++++++++++++++++++++++++++++++++
 ---------------------------------------------------------------------*)  
 
-NoDataLossShutdown ==
+NoDataLossShutdown(b) ==
     \* enabling conditions
     /\ aux_ctrs.no_data_loss_shutdown_ctr < NoDataLossShutdownLimit
-    /\ \E b \in Brokers, is_clean_shutdown \in BOOLEAN :
+    /\ \E is_clean_shutdown \in BOOLEAN :
         /\ broker_state[b].status \notin { OFFLINE_CLEAN, OFFLINE_DIRTY }
         \* state mutations
         /\ broker_state' = [broker_state EXCEPT ![b] = 
@@ -1357,6 +1343,7 @@ NoDataLossShutdown ==
         \* make the controller detect it
         /\ HandleBrokerFenced(b)
         /\ con_broker_reg' = [con_broker_reg EXCEPT ![b].status = FENCED]
+        /\ ResetPendingAcks(b)
         /\ UNCHANGED << partition_metadata, partition_data, partition_leso,
                         broker_metadata_log, inv_sent, inv_true_hwm, inv_consumed, 
                         aux_broker_epoch >>
@@ -1468,49 +1455,51 @@ Init ==
                        fence_broker_ctr          |-> 0,
                        leader_shrink_isr_ctr     |-> 0,
                        reassignment_ctr          |-> 0]
+        /\ aux_flo = [b \in Brokers |-> IntMax]
         /\ inv_sent = {}
         /\ inv_pos_acked = {}
         /\ inv_neg_acked = {}
         /\ inv_true_hwm = 1
         /\ inv_consumed = <<>>
-        /\ messages = <<>>
+        /\ NetworkInit
 
 Next ==
     \* broker/replica actions
-    \/ BrokerStart
-    \/ ReceiveBrokerRegResponse
-    \/ ReceiveMetadataUpdate
-    \/ SendAlterPartitionRequest
-    \/ ReceiveAlterPartitionResponse
-    \/ SendFetchRequest
-    \/ ReceiveFetchRequest
-    \/ ReceiveFetchResponse
-    \/ WriteRecordToLeader
-    \/ DataLossShutdown 
-    \/ NoDataLossShutdown
-    \* controller actions  
-    \/ ReceiveBrokerRegRequest
-    \/ ReceiveAlterPartitionRequest
-    \/ FenceBroker
-    \/ UnfenceBroker
+    \/ \E b \in Brokers :
+        \/ BrokerStart(b)
+        \/ ReceiveBrokerRegResponse(b)
+        \/ ReceiveMetadataUpdate(b)
+        \/ SendAlterPartitionRequest(b)
+        \/ ReceiveAlterPartitionResponse(b)
+        \/ SendFetchRequest(b)
+        \/ ReceiveFetchRequest(b)
+        \/ ReceiveFetchResponse(b)
+        \/ WriteRecordToLeader(b)
+        \/ DataLossShutdown (b)
+        \/ NoDataLossShutdown(b)
+        \* controller actions  
+        \/ ReceiveBrokerRegRequest(b)
+        \/ ReceiveAlterPartitionRequest(b)
+        \/ FenceBroker(b)
+        \/ UnfenceBroker(b)
     \/ PerformPartitionReassignment
 
 \* For liveness checking, we only need actions that help the 
 \* cluster make progress and help the cluster recover from 
 \* failures. Perturbations are excluded.
 Liveness ==
-    WF_vars(\/ BrokerStart
-            \/ ReceiveBrokerRegResponse
-            \/ ReceiveMetadataUpdate
-            \/ SendAlterPartitionRequest
-            \/ ReceiveAlterPartitionResponse
-            \/ SendFetchRequest
-            \/ ReceiveFetchRequest
-            \/ ReceiveFetchResponse
-            \/ WriteRecordToLeader
-            \/ ReceiveBrokerRegRequest
-            \/ ReceiveAlterPartitionRequest
-            \/ UnfenceBroker) 
+    \A b \in Brokers :
+        /\ WF_vars(BrokerStart(b))
+        /\ WF_vars(ReceiveBrokerRegResponse(b))
+        /\ WF_vars(ReceiveMetadataUpdate(b))
+        /\ WF_vars(SendAlterPartitionRequest(b))
+        /\ WF_vars(ReceiveAlterPartitionResponse(b))
+        /\ WF_vars(SendFetchRequest(b))
+        /\ WF_vars(ReceiveFetchRequest(b))
+        /\ WF_vars(ReceiveFetchResponse(b))
+        /\ WF_vars(ReceiveBrokerRegRequest(b))
+        /\ WF_vars(ReceiveAlterPartitionRequest(b))
+        /\ WF_vars(UnfenceBroker(b)) 
     
 Spec == Init /\ [][Next]_vars
 LivenessSpec == Init /\ [][Next]_vars /\ Liveness    
