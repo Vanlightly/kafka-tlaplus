@@ -1,6 +1,6 @@
 --------------------------- MODULE v3_5_functions ---------------------------
 EXTENDS FiniteSets, FiniteSetsExt, Sequences, SequencesExt, Integers, TLC,
-        v3_5_types, message_passing
+        v3_5_types, network
 
 \* ======================================================================
 \* ------------ Helpers -------------------------------------------------
@@ -59,6 +59,15 @@ ResetFollowerStateOfAllButISR(b, new_part_md) ==
                                         THEN BlankReplicaState
                                         ELSE partition_replica_state[b][b1]]]                                    
 
+\* the lowest offset written by this leader in unbroken
+\* leader terms (used to ack records written by a leader)
+\* Not a real concept in Kafka, a trick for this spec only.
+FloorLeaderOffset(b) ==
+    aux_flo[b]
+
+ResetPendingAcks(b) ==
+    aux_flo' = [aux_flo EXCEPT ![b] = IntMax]
+
 \* partition_pending_ap is used by the spec to know when it is pending 
 \* an AP request. If the epoch is higher than the current partition epoch
 \* then it is pending a response.
@@ -78,53 +87,6 @@ ReassignmentInProgress ==
     \/ con_partition_metadata.adding # {}
     \/ con_partition_metadata.removing # {}
 
-\* ==========================================================================
-\* -- State-space reducers and anti-cycle checks 
-\*    (for liveness properties and state space limiting) --
-\*
-\* To avoid cycles such as infinite fetch request/responses, the spec limits
-\* fetch requests to when they are required to make progress.
-\* Generally speaking, you can ignore this.
-
-\* This magic formula is able to see the state on both the local replica
-\* and the leader (which the replica can't actually do) and figure out
-\* if sending a fetch helps progress - else it will only enable a cycle. 
-\* This requires **great care** to avoid hiding legal behaviors that could
-\* result in invariant or liveness violations.
-__SendFetchMakesProgress(b) ==
-    LET leader == partition_metadata[b].leader
-        matching_epoch == partition_metadata[b].leader_epoch = partition_metadata[leader].leader_epoch
-    IN \* Limit when fetch requests can be sent according to the leader epoch on leader and follower
-       /\ CASE 
-            \* --- CASE Delayed partition but leader epoch doesn't match ------------------------
-               /\ broker_fetchers[b][leader].partition.delayed = TRUE
-               /\ matching_epoch = FALSE -> FALSE
-            \* --- CASE Model limits fetch requests to matching epoch but epochs don't match ----
-            [] /\ LimitFetchesOnLeaderEpoch = TRUE
-               /\ matching_epoch = FALSE -> FALSE
-            \* --- CASE else we can send the fetch
-            [] OTHER -> TRUE
-       \* one of the following is true:
-       /\ \* leader has records to get
-          \/ LeoOf(b) < LeoOf(leader)
-          \* leader has hwm to get                  
-          \/ HwmOf(b) < HwmOf(leader)        
-          \* leader hasn't received any fetch request from this follower
-          \/ ReplicaState(leader, b).leo = Nil
-          \* leader doesn't know current leo of this follower   
-          \/ /\ ReplicaState(leader, b).leo # Nil   
-             /\ ReplicaState(leader, b).leo < LeoOf(b)
-
-\* This prevents a replica from processing a fetch request with a larger leader
-\* epoch than its own (when LimitFetchesOnLeaderEpoch=TRUE).
-\* It shouldn't cause liveness issues as eventually the replica will learn of 
-\* the new leader epoch.
-__ReceiveFetchMakesProgress(m) ==
-    IF /\ LimitFetchesOnLeaderEpoch = TRUE
-       /\ m.partition.leader_epoch > partition_metadata[m.dest].leader_epoch
-    THEN FALSE
-    ELSE TRUE
-        
 \* ======================================================================
 \* ------------ Key functions -------------------------------------------
 \* These functions may be used in multiple places.
@@ -148,7 +110,6 @@ PartitionNeedsAction(b, md_offset) ==
     \* New followers (being added) react
     \/ /\ b \notin partition_metadata[b].replicas
        /\ b \in con_metadata_log[md_offset].replicas
-
 
 \*----------------------------------------------------
 \* FUNCTION: CommitOffsetOnFetch, CommitOffsetOnUpdate, CommitOffsetOnWrite
@@ -206,12 +167,11 @@ NoHighWatermarkChange ==
 \* replica wrote to its log (it knows this by matching its
 \* current leader epoch to the epoch of the record).
 SendAcksFor(b, lower, higher, ack_type) ==
-    LET curr_epoch == partition_metadata[b].leader_epoch
-        values == { v \in inv_sent : /\ v \notin inv_pos_acked
+    LET values == { v \in inv_sent : /\ v \notin inv_pos_acked
                                      /\ v \notin inv_neg_acked
                                      /\ \E offset \in lower..higher :
                                           /\ LogEntry(b, offset).value = v
-                                          /\ LogEntry(b, offset).epoch = curr_epoch }
+                                          /\ offset >= FloorLeaderOffset(b) }
     IN 
        IF ack_type = TRUE 
        THEN /\ inv_pos_acked' = inv_pos_acked \union values
@@ -456,11 +416,9 @@ LastOffsetForEpoch(b, req_epoch, is_leader) ==
 \* involved (to avoid these messages from being processed in the future).
 
 DropFetchSessions(b) ==
-    /\ messages' = [m \in DOMAIN messages |->
-                        CASE /\ m.type \in {FetchRequest, FetchResponse}
-                             /\ \/ m.dest = b
-                                \/ m.source = b -> 0 \* delivery count 0
-                          [] OTHER -> messages[m]]
+    /\ Drop({m \in Messages : /\ m.type \in {FetchRequest, FetchResponse}
+                              /\ \/ m.dest = b
+                                 \/ m.source = b})
     \* All fetcher state on this broker is lost. Also, the fetches fail on
     \* the brokers that have sent a fetch request to this broker.
     /\ broker_fetchers' = [b1 \in Brokers |->
@@ -479,5 +437,26 @@ DropFetchSessions(b) ==
                                   \* --- CASE no change to unaffected fetch sessions --------
                                   [] OTHER -> broker_fetchers[b1]]
                                   \* CASE END
+
+\*--------------------------------------------------------------
+\* FUNCTION: ValidateAlterPartitionRequest
+
+IsEligibleBroker(b, broker_epoch) ==
+    /\ con_broker_reg[b].status = UNFENCED
+    /\ \/ broker_epoch = 0                                  \* CHECK
+       \/ con_broker_reg[b].broker_epoch = broker_epoch
+    
+EligibleIsr(m) ==
+    \A b \in DOMAIN m.isr_and_epochs :
+        IsEligibleBroker(b, m.isr_and_epochs[b])    
+
+ValidateAlterPartitionRequest(b, m) ==
+    IF /\ b = con_partition_metadata.leader
+       /\ m.broker_epoch = con_broker_reg[b].broker_epoch               
+       /\ m.partition_epoch = con_partition_metadata.partition_epoch    \* CHECK
+    THEN IF EligibleIsr(m)
+         THEN Nil
+         ELSE IneligibleReplica
+    ELSE FencedLeaderEpoch
 
 =============================================================================    

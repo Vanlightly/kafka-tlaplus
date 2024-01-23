@@ -15,9 +15,8 @@ CONSTANTS CleanShutdownLimit,       \* limits the number of clean shutdowns
           FenceBrokerLimit,         \* limits the number of times the controller arbitrarily fences a broker
           LeaderShrinkIsrLimit,     \* limits the number of AlterPartition requests can shrink the ISR
           ReassignmentLimit,        \* limits the number of partition reassignments
-          AvoidLastReplicaStanding, \* When TRUE, does not follow actions that result in the LRS issue.
-          LimitFetchesOnLeaderEpoch \* limits the state space by reducing the number of FencedLeaderEpoch and
-                                    \* UnknownLeaderEpochs errors from fetch requests
+          AvoidLastReplicaStanding  \* When TRUE, does not follow actions that result in the LRS issue.
+          
 
 \* Controller-side broker statuses
 CONSTANTS FENCED,           
@@ -70,7 +69,6 @@ ASSUME UncleanShutdownLimit \in Nat
 ASSUME FenceBrokerLimit \in Nat
 ASSUME LeaderShrinkIsrLimit \in Nat
 ASSUME AvoidLastReplicaStanding \in BOOLEAN
-ASSUME LimitFetchesOnLeaderEpoch \in BOOLEAN
 
 \* Controller state
 VARIABLES con_unfenced,           \* the set of brokers which are in the state UNFENCED.
@@ -96,7 +94,9 @@ VARIABLES partition_status,         \* the role (leader, follower) and replicati
 
 \* Auxilliary variables (not part of the protocol)           
 VARIABLES aux_broker_epoch, \* Because we omit some metadata records, broker epochs cannot be based on metadata offsets.
-          aux_ctrs          \* Some counters used to limit the number of times certain actions can occur, to limit the state space.
+          aux_ctrs,         \* Some counters used to limit the number of times certain actions can occur, to limit the state space.
+          aux_flo           \* Floor Leader Offset. The lowest offset written by a leader. Not a real
+                            \* thing in Kafka, just used by this spec for producer ack logic.
 
 \* Auxilliary variables for verifying invariants (not part of the protocol)
 VARIABLES inv_sent,      \* The values sent and written to a leader
@@ -112,12 +112,13 @@ broker_vars == << broker_state, broker_fetchers, broker_metadata_log >>
 part_vars == << partition_status, partition_metadata, partition_data,
                 partition_leso, partition_replica_state, partition_pending_ap >>
 inv_vars == << inv_sent, inv_pos_acked, inv_neg_acked, inv_true_hwm, inv_consumed >>
-aux_vars == << aux_broker_epoch, aux_ctrs >>    
+aux_vars == << aux_broker_epoch, aux_ctrs, aux_flo >>    
 
 \* The set of brokers. Note that broker ids and replica
 \* ids are the same, and so Brokers ids are used within replica logic
 \* contexts.
 Brokers == 1..BrokerCount
+IntMax == 10000
 
 \* ======================================================================
 \* ------------ Object type definitions ---------------------------------

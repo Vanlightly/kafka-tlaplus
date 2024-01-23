@@ -14,9 +14,7 @@ CONSTANTS NoDataLossShutdownLimit,  \* limits the number of clean shutdowns
           DataLossShutdownLimit,    \* limits the number of unclean shutdowns
           FenceBrokerLimit,         \* limits the number of times the controller arbitrarily fences a broker
           LeaderShrinkIsrLimit,     \* limits the number of AlterPartition requests can shrink the ISR
-          ReassignmentLimit,        \* limits the number of partition reassignments
-          LimitFetchesOnLeaderEpoch \* limits the state space by reducing the number of FencedLeaderEpoch and
-                                    \* UnknownLeaderEpochs errors from fetch requests
+          ReassignmentLimit         \* limits the number of partition reassignments
 
 \* Controller-side broker statuses
 CONSTANTS FENCED,           
@@ -68,7 +66,6 @@ ASSUME NoDataLossShutdownLimit \in Nat
 ASSUME DataLossShutdownLimit \in Nat
 ASSUME FenceBrokerLimit \in Nat
 ASSUME LeaderShrinkIsrLimit \in Nat
-ASSUME LimitFetchesOnLeaderEpoch \in BOOLEAN
 
 \* Controller state
 VARIABLES con_unfenced,           \* the set of brokers which are in the state UNFENCED.

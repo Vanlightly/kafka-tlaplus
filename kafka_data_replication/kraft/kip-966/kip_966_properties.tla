@@ -5,7 +5,6 @@ EXTENDS FiniteSets, FiniteSetsExt, Sequences, SequencesExt, Integers, TLC,
         kip_966_functions
 
 Converged(leader, follower) ==
-\*    /\ broker_state[b1].
     /\ partition_data[leader].leo = partition_data[follower].leo
     /\ partition_data[leader].hwm = partition_data[follower].hwm
     /\ partition_replica_state[leader][follower].leo = partition_data[follower].leo

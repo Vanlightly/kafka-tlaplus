@@ -360,7 +360,7 @@ EnsureLeadershipRenounced(b, new_part_md) ==
     /\ MaybeFailPendingWrites(b, new_part_md)
     /\ ResetAllFollowerState(b)
     /\ ResetPendingAlterPartition(b)
-    /\ ResetPendingAcks(b)    
+    /\ ResetPendingAcks(b)
 
 \* --- Sub-Action 1: RemainLeader ---
 \* The replica remains leader, all it must do is conditionally advance the HWM
@@ -915,9 +915,6 @@ PerformPartitionReassignment ==
   request includes the fetch offset to indicate what records the 
   partition needs and the last_fetched_epoch that the leader will
   use to detect log divergence.
-  
-  Infinite fetch/response cycles are avoided here to ensure liveness
-  checking works.
 
   NO PROPOSAL CHANGE
 ---------------------------------------------------------------------*)
@@ -932,7 +929,6 @@ SendFetchRequest(from) ==
         /\ partition_metadata[from].leader = to        \* This replica believes the destination 
                                                        \* broker hosts the leader replica
         /\ ~Converged(to, from)
-\*        /\ __SendFetchMakesProgress(from) \* prevents infinite cycles
         \* state mutations
         /\ Send([type               |-> FetchRequest,
                  broker_epoch       |-> broker_state[from].broker_epoch,
@@ -1010,7 +1006,6 @@ ReceiveFetchRequest(b) ==
     \E m \in Messages :
         \* enabling conditions
         /\ m.type = FetchRequest
-\*        /\ __ReceiveFetchMakesProgress(m)
         /\ b = m.dest
         /\ LET last_epoch == LastOffsetForEpoch(b, m.partition.last_fetched_epoch, TRUE)
            IN
