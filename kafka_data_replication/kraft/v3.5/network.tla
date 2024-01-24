@@ -1,7 +1,18 @@
---------------------------- MODULE message_passing ---------------------------
+--------------------------- MODULE network ---------------------------
 EXTENDS FiniteSets, FiniteSetsExt, Sequences, SequencesExt, Integers, TLC
 
-VARIABLES messages
+VARIABLES messages,
+          messages_discard
+
+NetworkView == << messages >>
+NetworkVars == << messages, messages_discard >>
+
+Messages == messages
+ProcessedMessages == messages_discard
+
+NetworkInit == 
+    /\ messages = {}
+    /\ messages_discard = {}
 
 \* ======================================================================
 \* ----- Message passing ------------------------------------------------
@@ -10,18 +21,19 @@ VARIABLES messages
 \* If it does exist, the delivery count will go above 1 and
 \* the message can be delivered multiple times.
 SendFunc(m, msgs, deliver_count) ==
-    IF m \in DOMAIN msgs
-    THEN [msgs EXCEPT ![m] = @ + 1]
-    ELSE msgs @@ (m :> deliver_count)
+    IF deliver_count > 0
+    THEN msgs \union {m}
+    ELSE msgs
 
 \* Remove a message from the bag of messages. Used when a server is done
 \* processing a message.
 DiscardFunc(m, msgs) ==
-    [msgs EXCEPT ![m] = @ - 1]
+    msgs \ {m}
 
 \* Send a message, without restriction
 Send(m) ==
-    messages' = SendFunc(m, messages, 1)
+    /\ messages' = SendFunc(m, messages, 1)
+    /\ UNCHANGED messages_discard
 
 RECURSIVE SendAllFunc(_,_)
 SendAllFunc(send_msgs, msgs) ==
@@ -33,25 +45,30 @@ SendAllFunc(send_msgs, msgs) ==
          IN SendAllFunc(remaining, new_msgs)
 
 SendAll(msgs) ==
-    messages' = SendAllFunc(msgs, messages)
+    /\ messages' = SendAllFunc(msgs, messages)
+    /\ UNCHANGED messages_discard
 
 DiscardAndSendAll(d, msgs) ==
-    messages' = SendAllFunc(msgs, DiscardFunc(d, messages))
+    /\ messages' = SendAllFunc(msgs, DiscardFunc(d, messages))
+    /\ messages_discard' = messages_discard \union {d}
 
 \* Set the delivery count to 0 so the message cannot be processed again.
 Discard(d) ==
-    messages' = DiscardFunc(d, messages)
+    /\ messages' = DiscardFunc(d, messages)
+    /\ messages_discard' = messages_discard \union {d}
+    
+Drop(msgs) ==
+    /\ messages' = messages \ msgs
+    /\ messages_discard' = messages_discard \union msgs    
 
 \* Discard incoming message and reply with another    
 Reply(d, m) ==
-    /\ d \in DOMAIN messages
-    /\ messages[d] > 0 \* message must exist
+    /\ d \in messages
     /\ messages' = SendFunc(m, DiscardFunc(d, messages), 1)
-
-\* TRUE iff the message is of the desired type and has not
-\* been delivered yet.
-ReceivableMsg(m, type) ==
-    /\ m.type = type
-    /\ messages[m] > 0  \* the message hasn't been delivered yet
+    /\ messages_discard' = messages_discard \union {d}
+    
+PreviouslySent(m) ==
+    \/ m \in messages
+    \/ m \in messages_discard    
     
 =============================================================================    

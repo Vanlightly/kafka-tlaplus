@@ -1,8 +1,14 @@
 --------------------------- MODULE v3_5_properties ---------------------------
 EXTENDS FiniteSets, FiniteSetsExt, Sequences, SequencesExt, Integers, TLC,
-        message_passing,
+        network,
         v3_5_types,
         v3_5_functions
+
+Converged(leader, follower) ==
+    /\ partition_data[leader].leo = partition_data[follower].leo
+    /\ partition_data[leader].hwm = partition_data[follower].hwm
+    /\ partition_replica_state[leader][follower].leo = partition_data[follower].leo
+    /\ partition_replica_state[leader][follower].broker_epoch = broker_state[follower].broker_epoch
 
 \* ===============================================================
 \* INVARIANTS
@@ -139,8 +145,8 @@ LeaderCompletenessProperty ==
         LET leader == con_partition_metadata.leader
         IN  
             IF \/ leader = NoLeader
-            \/ /\ leader # NoLeader
-                /\ broker_state[leader].status # RUNNING
+               \/ /\ leader # NoLeader
+                  /\ broker_state[leader].status # RUNNING
             THEN TRUE \* If there is no leader or the leader isn't running then
                     \* this property cannot be verified.
             ELSE \* The leader LEO is not lower than the True HWM.
@@ -253,7 +259,10 @@ EventuallyMetadataConverges ==
             \* (this spec reduces state space by pausing metadata replication when no relevant unreplicated records exist)
             \/ /\ partition_status[b] = Follower
                /\ ~\E md_offset \in UnreplicatedOffsets(b) :
-                    PartitionNeedsAction(b, md_offset))
+                    PartitionNeedsAction(b, md_offset)
+            \* or this replica got removed from the replica set
+            \/ /\ partition_status[b] = Nil
+               /\ b \notin con_partition_metadata.replicas)
                     
 
 \* LIVENESS: EventuallyWriteIsAcceptedOrRejected

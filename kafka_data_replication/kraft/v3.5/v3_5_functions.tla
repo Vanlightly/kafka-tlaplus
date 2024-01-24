@@ -101,6 +101,9 @@ ReassignmentInProgress ==
 UnreplicatedOffsets(b) ==
     Len(broker_metadata_log[b])+1..Len(con_metadata_log)
 
+\* State-space limiter. When TRUE, the broker needs to
+\* pull the latest metadata log entries, when FALSE
+\* it doesn't need to for the system to make progress.
 PartitionNeedsAction(b, md_offset) ==
     \* Leaders react to all partition changes
     \/ partition_status[b] = Leader 
