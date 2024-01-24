@@ -83,8 +83,6 @@ Some notes about the specification:
 - The state space would be infinite as epochs are continually increasing, therefore
   the state space is limited by constants which limit the number of times
   certain actions can happen.
-- Liveness checks can be impacted by fetch request/response cycles so some
-  anti-cycle checks are used (ugly but unfortunately necessary for liveness checking).
 - Some formula are purely for the spec and should be ignored when using
   the spec to understand the design. These formulas are prefixed with
   __, such as __IgnoreThis.
@@ -135,7 +133,3 @@ Other constants limit the number perturbations which can occur:
 - `ReassignmentLimit` (limits the number of partition reassignments)
 
 Note that healing actions are never limited. For example, we limit the number of times brokers can get fenced, but never limit unfencing. We limit the number of ISR shrinks, but do not limit ISR expansions (we always let the partition heal).
-
-
-
-
