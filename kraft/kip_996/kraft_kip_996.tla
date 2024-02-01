@@ -106,6 +106,30 @@ CrashLoseState(s) ==
     /\ aux_ctrs' = [aux_ctrs EXCEPT !.crash_ctr = @ + 1]
     /\ UNCHANGED <<aux_disk_id_gen, server_ids, aux_disk_id_gen>>
 
+(* 
+    ACTION: CheckQuorumResign -------------------------------------
+    Server (s) is a leader but resigns because it cannot receive 
+    fetch requests from enough followers to consitute a functional
+    majority.
+    
+    This is only enabled when checking liveness.
+*)
+CheckQuorumResign(s) ==
+    /\ TestLiveness = TRUE
+    /\ s \in StartedServers
+    /\ state[s] = Leader
+    /\ LET connected_peers == Quantify(config[s].members, LAMBDA peer :
+                                        /\ s # peer
+                                        /\ Connected(s, peer))
+           min_connected == Cardinality(config[s].members) \div 2
+       IN /\ connected_peers < min_connected
+          /\ state' = [state EXCEPT ![s] = Resigned]
+          /\ leader' = [leader EXCEPT ![s] = Nil]
+          /\ votes_granted' = [votes_granted EXCEPT ![s] = {}]
+    /\ UNCHANGED <<NetworkVars, server_ids, role, config, current_epoch,
+                   voted_for, pending_fetch, pending_ack, invVars, 
+                   leaderVars, logVars, auxVars>>
+
 (*
     ACTION: VoterElectionTimeout -----------------------------------------------
     Server (s) is a voter and not the leader, and experiences
@@ -265,6 +289,7 @@ HandlePreVoteRequest(s) ==
                   THEN
                        /\ state' = [state EXCEPT ![s] = state0.state]
                        /\ leader' = [leader EXCEPT ![s] = state0.leader]
+                       /\ current_epoch' = [current_epoch EXCEPT ![s] = state0.epoch]
                        /\ Reply(m, [type         |-> RequestVoteResponse,
                                     epoch        |-> m.epoch,
                                     leader       |-> state0.leader,
@@ -281,8 +306,8 @@ HandlePreVoteRequest(s) ==
                                     error        |-> error,
                                     source       |-> s,
                                     dest         |-> peer])
-                       /\ UNCHANGED << state, leader >>
-               /\ UNCHANGED <<server_ids, role, current_epoch, config, voted_for,
+                       /\ UNCHANGED << state, leader, current_epoch >>
+               /\ UNCHANGED <<server_ids, role, config, voted_for,
                               pending_fetch, pending_ack, candidateVars, invVars,
                               leaderVars, logVars, auxVars>>
 
@@ -1269,6 +1294,7 @@ Next ==
         \/ ObserverFetchTimeout(s)
         \* leader actions -------------------------
         \/ ClientRequest(s)
+        \/ CheckQuorumResign(s)
     \/ \E s, peer \in AllServers :        
         \/ RejectFetchRequest(s, peer)
         \/ DivergingFetchRequest(s, peer)
@@ -1288,6 +1314,7 @@ Next ==
 *)    
 Fairness ==
     \A s \in AllServers :
+        /\ WF_vars(CheckQuorumResign(s))
         /\ WF_vars(VoterElectionTimeout(s))
         /\ WF_vars(ObserverFetchTimeout(s))
         /\ WF_vars(RequestPreVote(s))
