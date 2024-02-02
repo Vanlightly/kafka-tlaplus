@@ -91,6 +91,11 @@ AckedValueNotLost ==
             /\ role[s] = Voter
             /\ ValueInServerLog(s, v)
 
+ValidVotesRecv ==
+    \A s \in StartedServers :
+        Cardinality(votes_recv[s]) > 0 => 
+            state[s] \in {Prospective, Candidate}
+
 \* INV: Used in debugging
 TestInv ==
     TRUE

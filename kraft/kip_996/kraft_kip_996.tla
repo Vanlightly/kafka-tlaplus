@@ -46,7 +46,7 @@ RestartWithState(s) ==
                       [] OTHER -> @]
     /\ leader' = [leader EXCEPT ![s] = IF state[s] = Leader
                                        THEN Nil ELSE @]                                         
-    /\ votes_granted' = [votes_granted EXCEPT ![s] = {}]
+    /\ votes_recv' = [votes_recv EXCEPT ![s] = {}]
     /\ hwm' = [hwm EXCEPT ![s] = 0]
     /\ pending_fetch' = [pending_fetch EXCEPT ![s] = Nil]
     /\ ResetFollowerEndOffsetMap(s, DOMAIN flwr_end_offset[s])
@@ -97,7 +97,7 @@ CrashLoseState(s) ==
     /\ leader' = [leader EXCEPT ![s] = Nil]
     /\ voted_for' = [voted_for EXCEPT ![s] = Nil]
     /\ pending_fetch' = [pending_fetch EXCEPT ![s] = Nil] 
-    /\ votes_granted' = [votes_granted EXCEPT ![s] = {}]
+    /\ votes_recv' = [votes_recv EXCEPT ![s] = {}]
     /\ ResetFollowerEndOffsetMap(s, {})
     /\ log' = [log EXCEPT ![s] = <<>>]
     /\ hwm' = [hwm EXCEPT ![s] = 0]
@@ -122,13 +122,12 @@ CheckQuorumResign(s) ==
                                         /\ s # peer
                                         /\ Connected(s, peer))
            min_connected == Cardinality(config[s].members) \div 2
+           new_state     == TransitionToResigned(s)
        IN /\ connected_peers < min_connected
-          /\ state' = [state EXCEPT ![s] = Resigned]
-          /\ leader' = [leader EXCEPT ![s] = Nil]
-          /\ votes_granted' = [votes_granted EXCEPT ![s] = {}]
+          /\ ApplyState(s, new_state)
     /\ UNCHANGED <<NetworkVars, server_ids, role, config, current_epoch,
-                   voted_for, pending_fetch, pending_ack, invVars, 
-                   leaderVars, logVars, auxVars>>
+                   pending_fetch, pending_ack, invVars, leaderVars,
+                   logVars, auxVars>>
 
 (*
     ACTION: VoterElectionTimeout -----------------------------------------------
@@ -147,7 +146,7 @@ CheckQuorumResign(s) ==
 NotEnoughVotes(s, pre_vote) ==
     /\ ~HasInflightVoteReq(s, RequestVoteRequest, pre_vote)
     /\ ~HasInflightVoteRes(s, RequestVoteResponse, pre_vote)
-    /\ Cardinality(votes_granted[s]) < MajorityCount(config[s].members)
+    /\ Cardinality(votes_recv[s]) < MajorityCount(config[s].members)
     /\ state[s] # Leader
     
 ValidTimeout(s) ==
@@ -178,11 +177,9 @@ VoterElectionTimeout(s) ==
     /\ role[s] = Voter
     /\ s \in config[s].members
     /\ ValidTimeout(s)
-    /\ state' = [state EXCEPT ![s] = Prospective]
-    /\ leader' = [leader EXCEPT ![s] = Nil]
-    /\ votes_granted' = [votes_granted EXCEPT ![s] = {}]
-    /\ UNCHANGED <<server_ids, current_epoch, config, role, voted_for,
-                   pending_ack, flwr_end_offset, pending_fetch,
+    /\ ApplyState(s, TransitionToProspective(s))
+    /\ UNCHANGED <<server_ids, config, role, pending_ack, 
+                   flwr_end_offset, pending_fetch,
                    logVars, invVars, auxVars, NetworkVars>>
                    
 
@@ -210,11 +207,9 @@ ObserverFetchTimeout(s) ==
     /\ state[s] = Follower
     /\ leader[s] # Nil
     /\ ValidObserverTimeout(s)
-    /\ state' = [state EXCEPT ![s] = Unattached]
-    /\ leader' = [leader EXCEPT ![s] = Nil]
-    /\ UNCHANGED <<server_ids, current_epoch, config, role, voted_for,
-                   votes_granted, pending_ack, flwr_end_offset, pending_fetch,
-                   logVars, invVars, auxVars, NetworkVars>>                   
+    /\ ApplyState(s, TransitionToUnattached(s, current_epoch[s], role[s]))
+    /\ UNCHANGED <<server_ids, config, role, pending_ack, flwr_end_offset, 
+                   pending_fetch, logVars, invVars, auxVars, NetworkVars>>                   
 
 (*
     ACTION: RequestPreVote -----------------------------------------------
@@ -235,9 +230,9 @@ RequestPreVote(s) ==
     /\ role[s] = Voter
     /\ state[s] = Prospective
     /\ s \in config[s].members
-    /\ votes_granted[s] = {} \* not yet sent a pre-vote
+    /\ votes_recv[s] = {} \* not yet sent a pre-vote
     \* state mutations
-    /\ votes_granted' = [votes_granted EXCEPT ![s] = {s}] \* votes for itself
+    /\ votes_recv' = [votes_recv EXCEPT ![s] = {s}] \* votes for itself
     /\ pending_fetch' = [pending_fetch EXCEPT ![s] = Nil]
     /\ SendAll(
             {[type            |-> RequestVoteRequest,
@@ -265,6 +260,15 @@ RequestPreVote(s) ==
     1) epoch of (peer) >= epoch of (s)
     2) the last entry of (s) is <= to the last entry of (peer)
 *)
+
+ExpiredFetchResponseTime(s) ==
+    IF TestLiveness
+    THEN CASE leader[s] = Nil -> TRUE
+           [] \/ ~Connected(s, leader[s])
+              \/ state[leader[s]] # Leader -> TRUE
+           [] OTHER -> FALSE
+    ELSE FALSE
+
 HandlePreVoteRequest(s) ==
     \* enabling conditions
     \E m \in Messages :
@@ -276,40 +280,37 @@ HandlePreVoteRequest(s) ==
                            THEN FencedLeaderEpoch
                            ELSE Nil
                state0   == IF m.epoch > current_epoch[s]
-                           THEN TransitionToUnattached(s, m.epoch)
+                           THEN TransitionToUnattached(s, m.epoch, role[s])
                            ELSE NoTransition(s)
                log_ok == CompareEntries(m.last_log_offset,
                                         m.last_log_epoch,
                                         Len(log[s]),
                                         LastEpoch(log[s])) >= 0
-               grant == /\ state0.state # Follower 
+               grant == \* /\ state0.state # Follower TODO!!
+                        /\ ExpiredFetchResponseTime(s)
                         /\ log_ok
             IN \* state mutations
+               /\ ApplyState(s, state0)
                /\ IF error = Nil
-                  THEN
-                       /\ state' = [state EXCEPT ![s] = state0.state]
-                       /\ leader' = [leader EXCEPT ![s] = state0.leader]
-                       /\ current_epoch' = [current_epoch EXCEPT ![s] = state0.epoch]
-                       /\ Reply(m, [type         |-> RequestVoteResponse,
-                                    epoch        |-> m.epoch,
-                                    leader       |-> state0.leader,
-                                    vote_granted |-> grant,
-                                    pre_vote     |-> TRUE,
-                                    error        |-> Nil,
-                                    source       |-> s,
-                                    dest         |-> peer])
-                  ELSE /\ Reply(m, [type         |-> RequestVoteResponse,
-                                    epoch        |-> current_epoch[s],
-                                    leader       |-> leader[s],
-                                    vote_granted |-> FALSE,
-                                    pre_vote     |-> TRUE,
-                                    error        |-> error,
-                                    source       |-> s,
-                                    dest         |-> peer])
-                       /\ UNCHANGED << state, leader, current_epoch >>
-               /\ UNCHANGED <<server_ids, role, config, voted_for,
-                              pending_fetch, pending_ack, candidateVars, invVars,
-                              leaderVars, logVars, auxVars>>
+                  THEN Reply(m, [type         |-> RequestVoteResponse,
+                                 epoch        |-> m.epoch,
+                                 leader       |-> IF grant THEN Nil \* TODO!!
+                                                  ELSE state0.leader,
+                                 vote_granted |-> grant,
+                                 pre_vote     |-> TRUE,
+                                 error        |-> Nil,
+                                 source       |-> s,
+                                 dest         |-> peer])
+                  ELSE Reply(m, [type         |-> RequestVoteResponse,
+                                 epoch        |-> current_epoch[s],
+                                 leader       |-> state0.leader,
+                                 vote_granted |-> FALSE,
+                                 pre_vote     |-> TRUE,
+                                 error        |-> error,
+                                 source       |-> s,
+                                 dest         |-> peer])
+        /\ UNCHANGED <<server_ids, role, config, pending_fetch, pending_ack,
+                       invVars, leaderVars, logVars, auxVars>>
 
 (* 
     ACTION: HandleRequestPreVoteResponse --------------------------------
@@ -327,28 +328,15 @@ HandlePreVoteResponse(s) ==
         /\ role[s] = Voter \* new check because roles can change with reconfigurations
         \* state mutations
         /\ LET peer == m.source
-               new_state == MaybeHandleCommonResponse(s, m.leader, m.epoch, m.error)
-           IN
-              /\ CASE new_state.handled = TRUE ->
-                        /\ state' = [state EXCEPT ![s] = new_state.state]
-                        /\ leader' = [leader EXCEPT ![s] = new_state.leader]
-                        /\ current_epoch' = [current_epoch EXCEPT ![s] = new_state.epoch]
-                        /\ UNCHANGED <<votes_granted>>
-                   [] m.error # Nil ->
-                        UNCHANGED <<state, leader, current_epoch, votes_granted>>
-                   [] state[s] = Prospective ->
-                        /\ CASE m.vote_granted ->
-                                    /\ votes_granted' = [votes_granted EXCEPT ![s] =
-                                                            votes_granted[s] \union {peer}]
-                                    /\ UNCHANGED current_epoch
-                             [] m.epoch > current_epoch[s] ->
-                                    /\ current_epoch' = [current_epoch EXCEPT ![s] = m.epoch]
-                                    /\ UNCHANGED votes_granted
-                             [] OTHER -> UNCHANGED <<votes_granted, current_epoch>>
-                        /\ UNCHANGED <<state, leader>>
-                   [] OTHER -> UNCHANGED <<state, leader, current_epoch, votes_granted>>
+               state0 == MaybeHandleCommonResponse(s, m.leader, m.epoch, m.error)
+               state1 == IF /\ state0.handled = FALSE
+                            /\ state[s] = Prospective
+                            /\ m.vote_granted
+                         THEN [state0 EXCEPT !.votes_recv = @ \union {peer}]
+                         ELSE state0
+           IN /\ ApplyState(s, state1)
               /\ Discard(m)
-              /\ UNCHANGED <<server_ids, config, role, voted_for, pending_fetch, 
+              /\ UNCHANGED <<server_ids, config, role, pending_fetch, 
                              pending_ack, leaderVars, logVars, invVars, auxVars>> 
 
 (*
@@ -379,22 +367,19 @@ RequestVote(s) ==
     /\ state[s] = Prospective
     /\ WithinEpochLimit(s)
     /\ s \in config[s].members
-    /\ votes_granted[s] \in Quorum(config[s].members)
+    /\ votes_recv[s] \in Quorum(config[s].members)
     \* state mutations
-    /\ state' = [state EXCEPT ![s] = Candidate]
-    /\ current_epoch' = [current_epoch EXCEPT ![s] = current_epoch[s] + 1]
-    /\ leader' = [leader EXCEPT ![s] = Nil]
-    /\ voted_for' = [voted_for EXCEPT ![s] = s] \* votes for itself
-    /\ votes_granted' = [votes_granted EXCEPT ![s] = {s}] \* votes for itself
-    /\ pending_fetch' = [pending_fetch EXCEPT ![s] = Nil]
-    /\ SendAll(
-            {[type            |-> RequestVoteRequest,
-              epoch           |-> current_epoch[s] + 1,
-              last_log_epoch  |-> LastEpoch(log[s]),
-              last_log_offset |-> Len(log[s]),
-              pre_vote        |-> FALSE,  
-              source          |-> s,
-              dest            |-> s1] : s1 \in config[s].members \ {s}})
+    /\ LET new_state == TransitionToCandidate(s)
+       IN /\ ApplyState(s, new_state)
+          /\ pending_fetch' = [pending_fetch EXCEPT ![s] = Nil]
+          /\ SendAll(
+                  {[type            |-> RequestVoteRequest,
+                    epoch           |-> new_state.epoch,
+                    last_log_epoch  |-> LastEpoch(log[s]),
+                    last_log_offset |-> Len(log[s]),
+                    pre_vote        |-> FALSE,  
+                    source          |-> s,
+                    dest            |-> s1] : s1 \in config[s].members \ {s}})
     /\ UNCHANGED <<server_ids, config, role, pending_ack, leaderVars, logVars,
                    invVars, auxVars>>
 
@@ -413,7 +398,7 @@ RequestVote(s) ==
     2) the last entry of (s) is <= to the last entry of (peer)
     3) (s) has not already voted for a different server
 *)
-HandleRequestVoteRequest(s) ==
+HandleStandardVoteRequest(s) ==
     \* enabling conditions
     \E m \in Messages :
         /\ ReceivableMessage(m, RequestVoteRequest, AnyEpoch)
@@ -424,29 +409,25 @@ HandleRequestVoteRequest(s) ==
                            THEN FencedLeaderEpoch
                            ELSE Nil
                state0   == IF m.epoch > current_epoch[s]
-                           THEN TransitionToUnattached(s, m.epoch)
+                           THEN TransitionToUnattached(s, m.epoch, role[s])
                            ELSE NoTransition(s)
                log_ok == CompareEntries(m.last_log_offset,
                                         m.last_log_epoch,
                                         Len(log[s]),
                                         LastEpoch(log[s])) >= 0
-               grant == /\ \/ state0.state = Unattached
-                           \/ /\ state0.state = Voted
-                              /\ voted_for[s] = peer
-                        /\ log_ok
-               final_state == IF grant /\ state0.state = Unattached
-                              THEN TransitionToVoted(m.epoch, state0)
+               grant_vote == /\ \/ state0.state = Unattached
+                                \/ /\ state0.state = Voted
+                                   /\ voted_for[s] = peer
+                             /\ log_ok
+               final_state == IF grant_vote /\ state0.state = Unattached
+                              THEN TransitionToVoted(m.epoch, state0, peer)
                               ELSE state0                         
             IN \* state mutations
+               /\ ApplyState(s, final_state)
                /\ IF error = Nil
                   THEN
-                       /\ state' = [state EXCEPT ![s] = final_state.state]
-                       /\ current_epoch' = [current_epoch EXCEPT ![s] = final_state.epoch]
-                       /\ leader' = [leader EXCEPT ![s] = final_state.leader]
-                       /\ \/ /\ grant
-                             /\ voted_for' = [voted_for EXCEPT ![s] = peer]
-                          \/ /\ ~grant
-                             /\ UNCHANGED voted_for
+                       \* if a follower changed state then clear pending_fetch
+                       \* if a leader changed state, then fail any pending writes
                        /\ IF state # state'
                           THEN /\ pending_fetch' = [pending_fetch EXCEPT ![s] = Nil]
                                /\ FailPendingWrites(s)
@@ -454,23 +435,21 @@ HandleRequestVoteRequest(s) ==
                        /\ Reply(m, [type         |-> RequestVoteResponse,
                                     epoch        |-> m.epoch,
                                     leader       |-> final_state.leader,
-                                    vote_granted |-> grant,
+                                    vote_granted |-> grant_vote,
                                     pre_vote     |-> FALSE,
                                     error        |-> Nil,
                                     source       |-> s,
                                     dest         |-> peer])
                   ELSE /\ Reply(m, [type         |-> RequestVoteResponse,
                                     epoch        |-> current_epoch[s],
-                                    leader       |-> leader[s],
+                                    leader       |-> final_state.leader,
                                     vote_granted |-> FALSE,
                                     pre_vote     |-> FALSE,
                                     error        |-> error,
                                     source       |-> s,
                                     dest         |-> peer])
-                       /\ UNCHANGED << current_epoch, state, leader, voted_for,
-                                       pending_fetch, pending_ack, invVars>>
-               /\ UNCHANGED <<server_ids, role, config, candidateVars, 
-                              leaderVars, logVars, auxVars>>
+                       /\ UNCHANGED << pending_fetch, pending_ack, invVars>>
+               /\ UNCHANGED <<server_ids, role, config, leaderVars, logVars, auxVars>>
 
 (* 
     ACTION: HandleRequestVoteResponse --------------------------------
@@ -481,7 +460,7 @@ HandleRequestVoteRequest(s) ==
     - the server is not a Candidate anymore
     - the request epoch is lower than the server epoch.
 *)
-HandleRequestVoteResponse(s) ==
+HandleStandardVoteResponse(s) ==
     \* enabling conditions
     \E m \in Messages :
         /\ ReceivableMessage(m, RequestVoteResponse, AnyEpoch)
@@ -490,26 +469,15 @@ HandleRequestVoteResponse(s) ==
         /\ role[s] = Voter \* new check because roles can change with reconfigurations
         \* state mutations
         /\ LET peer == m.source
-               new_state == MaybeHandleCommonResponse(s, m.leader, m.epoch, m.error)
-           IN
-              /\ IF new_state.handled = TRUE
-                 THEN /\ state' = [state EXCEPT ![s] = new_state.state]
-                      /\ leader' = [leader EXCEPT ![s] = new_state.leader]
-                      /\ current_epoch' = [current_epoch EXCEPT ![s] = new_state.epoch]
-                      /\ UNCHANGED <<votes_granted>>
-                 ELSE
-                      CASE m.epoch # Nil ->
-                                UNCHANGED <<state, leader, current_epoch, votes_granted>>
-                        [] state[s] = Candidate ->
-                                /\ IF m.vote_granted
-                                   THEN votes_granted' = [votes_granted EXCEPT ![s] =
-                                                              votes_granted[s] \union {peer}]
-                                   ELSE UNCHANGED <<votes_granted>>
-                                /\ UNCHANGED <<state, leader, current_epoch>>
-                        [] OTHER ->
-                                UNCHANGED <<state, leader, current_epoch, votes_granted>>
+               state0 == MaybeHandleCommonResponse(s, m.leader, m.epoch, m.error)
+               state1 == IF /\ state0.handled = FALSE
+                            /\ state[s] = Candidate
+                            /\ m.vote_granted
+                         THEN [state0 EXCEPT !.votes_recv = @ \union {peer}]
+                         ELSE state0
+           IN /\ ApplyState(s, state1)
               /\ Discard(m)
-              /\ UNCHANGED <<server_ids, config, role, voted_for, pending_fetch, 
+              /\ UNCHANGED <<server_ids, config, role, pending_fetch, 
                              pending_ack, leaderVars, logVars, invVars, auxVars>>               
 
 (*
@@ -523,20 +491,27 @@ BecomeLeader(s) ==
     \* enabling conditions
     /\ s \in StartedServers
     /\ state[s] = Candidate
-    /\ votes_granted[s] \in Quorum(config[s].members)
+    /\ votes_recv[s] \in Quorum(config[s].members)
     \* state mutations
-    /\ state' = [state EXCEPT ![s] = Leader]
-    /\ leader' = [leader EXCEPT ![s] = s]
-    /\ ResetFollowerEndOffsetMap(s, config[s].members)
-    /\ votes_granted' = [votes_granted EXCEPT ![s] = {}]
-    /\ SendAllOnce(
-            {[type    |-> BeginQuorumRequest,
-              epoch   |-> current_epoch[s],
-              source  |-> s,
-              dest    |-> peer] : peer \in config[s].members \ {s}})
-    /\ UNCHANGED <<server_ids, config, role, current_epoch, voted_for,
-                   pending_fetch, pending_ack, logVars,
-                   invVars, auxVars>>
+    /\ LET new_state == TransitionToLeader(s)
+           \* insert a new entry for this leader epoch
+           entry == [command |-> LeaderChangeRecord,
+                     epoch   |-> current_epoch[s],
+                     value   |-> Nil]
+           new_log == Append(log[s], entry)
+       IN /\ ApplyState(s, new_state)
+          /\ log' = [log EXCEPT ![s] = new_log]
+          /\ IF Cardinality(config[s].members) = 1
+             THEN hwm' = [hwm EXCEPT ![s] = Len(new_log)]
+             ELSE UNCHANGED hwm
+          /\ ResetFollowerEndOffsetMap(s, config[s].members)
+          /\ SendAllOnce(
+                  {[type    |-> BeginQuorumRequest,
+                    epoch   |-> current_epoch[s],
+                    source  |-> s,
+                    dest    |-> peer] : peer \in config[s].members \ {s}})
+          /\ UNCHANGED <<server_ids, config, role, pending_fetch, pending_ack, 
+                         hwm, invVars, auxVars>>
 
 (* 
     ACTION: AcceptBeginQuorumRequest -------------------------------------------
@@ -562,17 +537,11 @@ AcceptBeginQuorumRequest(s) ==
            IN /\ error = Nil
               /\ role[s] = Voter \* new check because roles can change with reconfigurations
               \* state mutations
-              /\ state' = [state EXCEPT ![s] = new_state.state]
-              /\ leader' = [leader EXCEPT ![s] = new_state.leader]
-              /\ current_epoch' = [current_epoch EXCEPT ![s] = new_state.epoch]
+              /\ ApplyState(s, new_state)
               /\ pending_fetch' = [pending_fetch EXCEPT ![s] = Nil]
-              /\ IF state' # state
-                 THEN votes_granted' = [votes_granted EXCEPT ![s] = {}]
-                 ELSE UNCHANGED votes_granted
               /\ FailPendingWrites(s)
               /\ Discard(m)
-        /\ UNCHANGED <<server_ids, config, role, voted_for, 
-                       logVars, leaderVars, auxVars>>
+        /\ UNCHANGED <<server_ids, config, role, logVars, leaderVars, auxVars>>
 
 (* 
     ACTION: ClientRequest ----------------------------------
@@ -604,11 +573,14 @@ ClientRequest(s) ==
                          value   |-> v]
                new_log == Append(log[s], entry)
            IN  /\ log' = [log EXCEPT ![s] = new_log]
+               /\ IF Cardinality(config[s].members) = 1
+                  THEN hwm' = [hwm EXCEPT ![s] = Len(new_log)]
+                  ELSE UNCHANGED hwm
                /\ pending_ack' = [pending_ack EXCEPT ![s] = @ \union {v}]
                /\ inv_sent' = inv_sent \union {v}
         /\ UNCHANGED <<server_ids, config, current_epoch, role, state, voted_for, 
                        leader, pending_fetch, NetworkVars, candidateVars,
-                       leaderVars, hwm, inv_pos_acked, inv_neg_acked, auxVars>>
+                       leaderVars, inv_pos_acked, inv_neg_acked, auxVars>>
                        
 (* 
     ACTION: SendFetchRequest ----------------------------------------
@@ -822,6 +794,7 @@ AcceptFetchRequestFromVoter(s, peer) ==
                      new_config     == ConfigFor(config_entry.offset, 
                                                  config_entry.entry, 
                                                  new_hwm)
+                     leave_state    == TransitionToUnattached(s, current_epoch[s], Observer)
                  IN
                     /\ IF new_hwm > hwm[s]
                        THEN /\ config' = [config EXCEPT ![s] = new_config]
@@ -830,9 +803,7 @@ AcceptFetchRequestFromVoter(s, peer) ==
                             /\ IF leaves
                                THEN \* the server resigns and becomes an unattached observer
                                     /\ role' = [role EXCEPT ![s] = Observer]
-                                    /\ state' = [state EXCEPT ![s] = Unattached]
-                                    /\ leader' = [leader EXCEPT ![s] = Nil]
-                                    /\ votes_granted' = [votes_granted EXCEPT ![s] = {}]
+                                    /\ ApplyState(s, leave_state)
                                     /\ ResetFollowerEndOffsetMap(s, {})
                                     /\ hwm' = [hwm EXCEPT ![s] = 0]
                                ELSE \* the end offset of the peer is updated, but we may also have switched
@@ -845,10 +816,10 @@ AcceptFetchRequestFromVoter(s, peer) ==
                                                                     THEN new_end_offset[s1]
                                                                     ELSE 0]]
                                     /\ hwm' = [hwm EXCEPT ![s] = new_hwm]
-                                    /\ UNCHANGED <<role, state, leader, votes_granted>>
+                                    /\ UNCHANGED <<role, state, leader, current_epoch, votes_recv, voted_for>>
                        ELSE /\ flwr_end_offset' = [flwr_end_offset EXCEPT ![s] = new_end_offset]
-                            /\ UNCHANGED <<role, config, state, leader, votes_granted, 
-                                           pending_ack, hwm, invVars>>
+                            /\ UNCHANGED <<role, config, state, leader, current_epoch, votes_recv, 
+                                           voted_for, pending_ack, hwm, invVars>>
                     /\ Reply(m, [type        |-> FetchResponse,
                                  epoch       |-> current_epoch[s],
                                  leader      |-> IF leaves THEN Nil ELSE leader[s],
@@ -859,8 +830,8 @@ AcceptFetchRequestFromVoter(s, peer) ==
                                  source      |-> s,
                                  dest        |-> peer,
                                  correlation |-> m])                    
-                    /\ UNCHANGED <<server_ids, current_epoch, log, voted_for, pending_fetch, 
-                                   inv_sent, inv_neg_acked, aux_ctrs, aux_disk_id_gen>>
+                    /\ UNCHANGED <<server_ids, log, pending_fetch, inv_sent, 
+                                   inv_neg_acked, aux_ctrs, aux_disk_id_gen>>
 
 (* 
     ACTION: AcceptFetchRequestFromObserver ------------------
@@ -898,113 +869,62 @@ AcceptFetchRequestFromObserver(s, peer) ==
               /\ UNCHANGED <<server_ids, serverVars, candidateVars, leaderVars,
                              logVars, invVars, auxVars>>
        
-(* 
-    ACTION: HandleSuccessFetchResponse ---------------------
-    A server receives a successful FetchResponse, appends
-    any entries to its log and updates its high watermark.
-
-    The response may include a reconfiguration command
-    and if so, the server immediately switches to the new
-    configuration.
+(* ACTION: HandleFetchResponse ------------------------
+   
+   A server receives a FetchResponse, and the response
+   may indicate success, failure or a diverging epoch.
+   
+   In the case of a successful response, the server appends
+   an records to its log. The new entries may include a 
+   reconfiguration command and if so, the server immediately 
+   switches to the new configuration.
+   
+   In the case that it is a diverging epoch response, the 
+   follower truncates its log to the highest entry it has 
+   below the indicated divergent position. Log truncation 
+   could remove a reconfiguration command, so this may cause
+   the server to switch to a prior configuration.
+   
+   Other cases are handled by the MaybeHandleCommonResponse
+   logic which can involve transitioning to Unattached or
+   Follower. For example, if this is an observer and the 
+   error was NotLeader and the id of the leader was included
+   in the response, the observer can now send fetches to that
+   leader. See MaybeHandleCommonResponse for logic flow.
 *)
-HandleSuccessFetchResponse(s) ==
+
+HandleFetchResponse(s) ==
     \* enabling conditions
     \E m \in Messages :
         /\ ReceivableMessage(m, FetchResponse, AnyEpoch)
         /\ s = m.dest
         /\ LET new_state    == MaybeHandleCommonResponse(s, m.leader, m.epoch, m.error)
-               new_log      == IF Len(m.entries) > 0
-                               THEN [log EXCEPT ![s] = Append(@, m.entries[1])]
-                               ELSE log 
+               new_log      == CASE m.result = Ok ->
+                                   IF Len(m.entries) > 0
+                                   THEN [log EXCEPT ![s] = Append(@, m.entries[1])]
+                                   ELSE log
+                                [] m.result = Diverging ->
+                                   [log EXCEPT ![s] = TruncateLog(s, m)]
+                                [] OTHER -> log
                config_entry == MostRecentReconfigEntry(new_log[s])
                curr_config  == ConfigFor(config_entry.offset,
                                          config_entry.entry,
                                          m.hwm)
-           IN /\ m.result = Ok
-              /\ new_state.handled = FALSE
-              /\ pending_fetch[s] = m.correlation
-              \* state mutations
-              /\ MaybeSwitchConfigurations(s, curr_config, new_state)                    
-              /\ hwm' = [hwm  EXCEPT ![s] = m.hwm]
-              /\ log' = new_log
-              /\ pending_fetch' = [pending_fetch EXCEPT ![s] = Nil]
+           IN /\ pending_fetch[s] = m.correlation
+              /\ IF \/ new_state.handled = TRUE
+                    \/ state[s] # Follower
+                 THEN /\ ApplyState(s, new_state)
+                      /\ pending_fetch' = [pending_fetch EXCEPT ![s] = Nil]
+                      /\ UNCHANGED << role, log, hwm, config, flwr_end_offset >>
+                 ELSE /\ MaybeSwitchConfigurations(s, curr_config, new_state)
+                      /\ pending_fetch' = [pending_fetch EXCEPT ![s] = Nil]
+                      /\ log' = new_log
+                      /\ IF m.result = Ok
+                         THEN hwm' = [hwm  EXCEPT ![s] = m.hwm]
+                         ELSE UNCHANGED hwm
+                      /\ UNCHANGED voted_for
               /\ Discard(m)
-              /\ UNCHANGED <<server_ids, current_epoch, voted_for, pending_ack,
-                             candidateVars, invVars, auxVars>>
-
-(*
-    ACTION: HandleDivergingFetchResponse ------------------------
-    Server (s) is a Follower that receives a Fetch response 
-    that indicates that the fetch position is inconsistent. 
-    The response includes the highest offset of the last common
-    epoch the leader and follower share, so the follower truncates
-    its log to the highest entry it has at or below that
-    point which will be the highest common entry that the 
-    leader and follower share.
-
-    Log truncation could remove a reconfiguration command, so
-    this may cause the server to switch to a prior configuration.
-
-    After this it can send another FetchRequest to the leader
-    from a valid fetch position.
-*)
-HandleDivergingFetchResponse(s) ==
-    \* enabling conditions
-    \E m \in Messages :
-        /\ ReceivableMessage(m, FetchResponse, AnyEpoch)
-        /\ s = m.dest
-        /\ LET new_state    == MaybeHandleCommonResponse(s, m.leader, m.epoch, m.error)
-               new_log      == [log EXCEPT ![s] = TruncateLog(s, m)] 
-               config_entry == MostRecentReconfigEntry(new_log[s])
-               curr_config  == ConfigFor(config_entry.offset,
-                                         config_entry.entry,
-                                         m.hwm)
-           IN 
-              /\ m.result = Diverging
-              /\ new_state.handled = FALSE
-              /\ pending_fetch[s] = m.correlation
-              \* state mutations
-              \* The server could have truncated the reconfig command
-              \* of the current configuration, causing the server
-              \* to revert to the prior configuration.
-              /\ MaybeSwitchConfigurations(s, curr_config, new_state)
-              \* update log
-              /\ log' = new_log
-              /\ pending_fetch' = [pending_fetch EXCEPT ![s] = Nil] 
-              /\ Discard(m)
-        /\ UNCHANGED <<server_ids, current_epoch, voted_for, pending_ack,
-                       candidateVars, hwm, invVars, auxVars>>
-                       
-(* ACTION: HandleNonSuccessFetchResponse ------------------------
-    Server (s) receives a FetchResponse from that satisfies one 
-    of the following conditions:
-    (1) It is an error response
-    (2) (s) has entered an illegal state
-    (3) (s) transitions to a new state where no further processing
-        of this message should happen. Such as transitioning to 
-        follower state in a new epoch.
-    
-    If this is an observer and the error was NotLeader and the id of
-    the leader was included in the response, the observer can now send
-    fetches to that leader.
-*)
-HandleNonSuccessFetchResponse(s) ==
-    \* enabling conditions
-    \E m \in Messages :
-        /\ ReceivableMessage(m, FetchResponse, AnyEpoch)
-        /\ s = m.dest
-        /\ LET new_state == MaybeHandleCommonResponse(s, m.leader, m.epoch, m.error)
-           IN
-              /\ new_state.handled = TRUE
-              /\ pending_fetch[s] = m.correlation
-              \* state mutations
-              /\ state' = [state EXCEPT ![s] = new_state.state]
-              /\ leader' = [leader EXCEPT ![s] = new_state.leader]
-              /\ current_epoch' = [current_epoch EXCEPT ![s] = new_state.epoch]
-              /\ pending_fetch' = [pending_fetch EXCEPT ![s] = Nil]
-              /\ Discard(m)
-        /\ UNCHANGED <<server_ids, role, config, voted_for, pending_ack,
-                       votes_granted, leaderVars, logVars, invVars, auxVars>>                       
+              /\ UNCHANGED <<server_ids, pending_ack, invVars, auxVars>>
 
 \* ----------------------------------------------
 \* RECONFIGURATION ------------------------------
@@ -1056,7 +976,7 @@ StartNewServer ==
                  /\ voted_for' = voted_for @@ (new_server :> Nil)
                  /\ pending_fetch' = pending_fetch @@ (new_server :> fetch_msg) 
                  /\ pending_ack' = pending_ack @@ (new_server :> {})
-                 /\ votes_granted' = votes_granted @@ (new_server :> {})
+                 /\ votes_recv' = votes_recv @@ (new_server :> {})
                  /\ flwr_end_offset' = flwr_end_offset @@ (new_server :> EmptyMap)
                  /\ log' = log @@ (new_server :> <<>>)
                  /\ hwm' = hwm @@ (new_server :> 0)
@@ -1219,7 +1139,7 @@ InitServerVars(init_leader, server_identities) ==
                                                committed |-> TRUE]]
 
 InitCandidateVars(servers) == 
-    votes_granted   = [s \in servers |-> {}]
+    votes_recv   = [s \in servers |-> {}]
 
 InitLeaderVars(servers) == 
     flwr_end_offset  = [s \in servers |-> [s1 \in servers |-> 1]]
@@ -1282,15 +1202,13 @@ Next ==
         \/ HandlePreVoteRequest(s)
         \/ HandlePreVoteResponse(s)
         \/ RequestVote(s)
-        \/ HandleRequestVoteRequest(s)
-        \/ HandleRequestVoteResponse(s)
+        \/ HandleStandardVoteRequest(s)
+        \/ HandleStandardVoteResponse(s)
         \/ BecomeLeader(s)
         \* follower actions -----------------------
         \/ AcceptBeginQuorumRequest(s)
         \/ SendFetchRequest(s)
-        \/ HandleSuccessFetchResponse(s)
-        \/ HandleDivergingFetchResponse(s)
-        \/ HandleNonSuccessFetchResponse(s)
+        \/ HandleFetchResponse(s)
         \/ ObserverFetchTimeout(s)
         \* leader actions -------------------------
         \/ ClientRequest(s)
@@ -1321,14 +1239,12 @@ Fairness ==
         /\ WF_vars(HandlePreVoteRequest(s))
         /\ WF_vars(HandlePreVoteResponse(s))
         /\ WF_vars(RequestVote(s))
-        /\ WF_vars(HandleRequestVoteRequest(s))
-        /\ WF_vars(HandleRequestVoteResponse(s))
+        /\ WF_vars(HandleStandardVoteRequest(s))
+        /\ WF_vars(HandleStandardVoteResponse(s))
         /\ WF_vars(BecomeLeader(s))
         /\ WF_vars(AcceptBeginQuorumRequest(s))
         /\ WF_vars(SendFetchRequest(s))
-        /\ WF_vars(HandleSuccessFetchResponse(s))
-        /\ WF_vars(HandleDivergingFetchResponse(s))
-        /\ WF_vars(HandleNonSuccessFetchResponse(s))
+        /\ WF_vars(HandleFetchResponse(s))
         /\ \A peer \in AllServers :
             /\ WF_vars(RejectFetchRequest(s, peer))
             /\ WF_vars(DivergingFetchRequest(s, peer))

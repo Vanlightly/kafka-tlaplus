@@ -188,17 +188,17 @@ SetIllegalState ==
     [state        |-> IllegalState,
      epoch        |-> 0, 
      leader       |-> Nil,
-     transitioned |-> TRUE]
+     votes_recv   |-> {}]
 
 NoTransition(s) ==
-    (* Creates a record with current values. Transitioned = FALSE
-       as no state transition has occurred. *)
+    (* Creates a record with current values.*)
     [state        |-> state[s], 
      epoch        |-> current_epoch[s], 
      leader       |-> leader[s],
-     transitioned |-> FALSE]
+     votes_recv   |-> votes_recv[s],
+     voted_for    |-> voted_for[s]]
 
-TransitionToVoted(epoch, state0) ==
+TransitionToVoted(epoch, state0, vote_recipient) ==
     (* The server has voted for a peer in this epoch and transitioned
        to Voted. The if statement is not really necessary here, but 
        this check exists in the code. *)
@@ -208,21 +208,22 @@ TransitionToVoted(epoch, state0) ==
     ELSE [state        |-> Voted,
           epoch        |-> epoch,
           leader       |-> Nil,
-          transitioned |-> TRUE]
+          votes_recv   |-> {},
+          voted_for    |-> vote_recipient]
 
-TransitionToUnattached(s, epoch) ==
+TransitionToUnattached(s, epoch, curr_role) ==
     (* Either:
-        - The server has learned of a higher epoch but not
+        - A voter has learned of a higher epoch but not
           yet learned who the new leader is. 
-        - The server has been told that the receiver did not know
-          who the leader was, in the current epoch, due to election timeout
-          without epoch bump. KIP-996 *)
-    IF current_epoch[s] = epoch
+        - An observer has received a NotLeader fetch response .*)
+    IF /\ curr_role = Voter
+       /\ current_epoch[s] = epoch
     THEN SetIllegalState
     ELSE [state        |-> Unattached, 
           epoch        |-> epoch, 
           leader       |-> Nil,
-          transitioned |-> TRUE]
+          votes_recv   |-> {},
+          voted_for    |-> Nil]  \* forget prior vote
      
 TransitionToFollower(s, leader_id, epoch) ==
     (* The follower has learned who the leader is in this epoch *)
@@ -231,9 +232,44 @@ TransitionToFollower(s, leader_id, epoch) ==
           \/ state[s] = Leader
     THEN SetIllegalState
     ELSE [state        |-> Follower, 
-          epoch        |-> epoch, 
+          epoch        |-> epoch,
           leader       |-> leader_id,
-          transitioned |-> TRUE]
+          votes_recv   |-> {},
+          \* only forget prior vote if epoch bumped
+          voted_for    |-> IF epoch > current_epoch[s]
+                           THEN Nil ELSE voted_for[s]]
+          
+TransitionToLeader(s) ==
+    [state        |-> Leader, 
+     epoch        |-> current_epoch[s],
+     leader       |-> s,
+     votes_recv   |-> {},
+     voted_for    |-> voted_for[s]] \* don't forget prior vote
+     
+TransitionToResigned(s) ==
+    [state        |-> Resigned, 
+     epoch        |-> current_epoch[s],
+     leader       |-> Nil,
+     votes_recv   |-> {},
+     voted_for    |-> voted_for[s]]  \* don't forget prior vote
+     
+TransitionToProspective(s) ==
+    (* Transitioning to Prospective and sending pre-votes occur
+       in separate actions, so votes_recv remains empty*)
+    [state        |-> Prospective, 
+     epoch        |-> current_epoch[s],
+     leader       |-> Nil,
+     votes_recv   |-> {},
+     voted_for    |-> voted_for[s]] \* don't forget prior vote
+
+TransitionToCandidate(s) ==
+    (* Transitioning to Candidate and sending vote requests occur
+       in the same action, so (s) added to votes_recv *)
+    [state        |-> Candidate, 
+     epoch        |-> current_epoch[s] + 1,
+     leader       |-> Nil,
+     votes_recv   |-> {s}, \* votes for itself
+     voted_for    |-> s]   \* votes for itself
 
 MaybeTransition(s, leader_id, epoch) ==
     (*
@@ -248,7 +284,7 @@ MaybeTransition(s, leader_id, epoch) ==
             \* if the request contained the leader id, else become
             \* unattached
             IF leader_id = Nil
-            THEN TransitionToUnattached(s, epoch)
+            THEN TransitionToUnattached(s, epoch, role[s])
             ELSE TransitionToFollower(s, leader_id, epoch)
       []  /\ leader_id # Nil  \* message contains a leader id 
           /\ leader[s] = Nil  \* this server doesn't know who the leader is
@@ -265,9 +301,6 @@ MaybeHandleCommonResponse(s, leader_id, epoch, errors) ==
     (*
         Common code between multiple response handlers:
         Note: 
-        - The Transitioned field indicates whether a state transition
-          happened. If TRUE then the parent action should update the 
-          corresponding variables.
         - The Handled field indicates whether action has already been
           taken. When TRUE, the parent action should do no more 
           processing of this response, only update the corresponding
@@ -278,7 +311,8 @@ MaybeHandleCommonResponse(s, leader_id, epoch, errors) ==
                 [state        |-> state[s],
                  epoch        |-> current_epoch[s],
                  leader       |-> leader[s],
-                 transitioned |-> FALSE,
+                 votes_recv   |-> votes_recv[s],
+                 voted_for    |-> voted_for[s],
                  handled      |-> TRUE,
                  error        |-> errors]
       \* CASE 2) higher epoch or an error ---------------
@@ -291,20 +325,30 @@ MaybeHandleCommonResponse(s, leader_id, epoch, errors) ==
       [] /\ epoch = current_epoch[s]
          /\ leader_id # Nil
          /\ leader[s] = Nil ->
-                [state        |-> Follower, 
-                 leader       |-> leader_id,
-                 epoch        |-> current_epoch[s],
-                 transitioned |-> TRUE,
-                 handled      |-> errors # Nil,
-                 error        |-> errors]
+                TransitionToFollower(s, leader_id, epoch) @@
+                     [handled |-> TRUE, 
+                      error   |-> errors]
       \* CASE 4) no changes to state or leadership --------
       [] OTHER -> 
                 [state        |-> state[s],
                  epoch        |-> current_epoch[s], 
                  leader       |-> leader[s],
-                 transitioned |-> FALSE,
+                 votes_recv   |-> votes_recv[s],
+                 voted_for    |-> voted_for[s],
                  handled      |-> FALSE,
                  error        |-> errors]
+
+MaybeApplyChange(s, field, value) ==
+    IF field[s] # value
+    THEN field' = [field EXCEPT ![s] = value]
+    ELSE UNCHANGED field 
+
+ApplyState(s, new_state) ==
+    /\ MaybeApplyChange(s, state, new_state.state)
+    /\ MaybeApplyChange(s, leader, new_state.leader)
+    /\ MaybeApplyChange(s, current_epoch, new_state.epoch)
+    /\ MaybeApplyChange(s, votes_recv, new_state.votes_recv)
+    /\ MaybeApplyChange(s, voted_for, new_state.voted_for)
 
 UpdateFollowerEndOffsetMap(s, new_members) ==
     (* Updates the server's follower end offset map with the
@@ -368,22 +412,26 @@ MaybeSwitchConfigurations(s, curr_config, new_state) ==
         to a new configuration or reverting to the prior 
         configuration (in the case of a log truncation).  
     *)
-    /\ leader' = [leader EXCEPT ![s] = new_state.leader]
+    /\ MaybeApplyChange(s, leader, new_state.leader)
+    /\ MaybeApplyChange(s, current_epoch, new_state.epoch)
     /\ config' = [config EXCEPT ![s] = curr_config]
          \* CASE 1) The server (a voter )has been removed from
          \*         membership and become an observer.
     /\ CASE role[s] = Voter /\ s \notin curr_config.members ->
                /\ role'  = [role EXCEPT ![s] = Observer]
                /\ state' = [state EXCEPT ![s] = Follower]
+               /\ MaybeApplyChange(s, votes_recv, {})
          \* CASE 2) The server (an observer) has been added 
          \*         to membership as a voter.
          [] role[s] = Observer /\ s \in curr_config.members ->
                /\ role'  = [role EXCEPT ![s] = Voter]
                /\ state' = [state EXCEPT ![s] = Follower]
+               /\ MaybeApplyChange(s, votes_recv, {})
          \* CASE 3) The server role is unchanged.
          [] OTHER -> 
-               /\ state' = [state EXCEPT ![s] = new_state.state]
                /\ UNCHANGED role
+               /\ MaybeApplyChange(s, state, new_state.state)
+               /\ MaybeApplyChange(s, votes_recv, new_state.votes_recv)
     /\ UpdateFollowerEndOffsetMap(s, curr_config.members)
 
 LeaderHasCommittedOffsetsInCurrentEpoch(s) ==

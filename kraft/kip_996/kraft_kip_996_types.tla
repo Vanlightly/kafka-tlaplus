@@ -41,7 +41,8 @@ CONSTANTS Unattached,  \* Voter or observer, but leader unknown.
 CONSTANTS AppendCommand,        \* contains a client value
           InitClusterCommand,   \* contains the initial configuration
           AddVoterCommand,      \* reconfiguration command to add a voter
-          RemoveVoterCommand    \* reconfiguration command to remove a voter
+          RemoveVoterCommand,   \* reconfiguration command to remove a voter
+          LeaderChangeRecord
 
 \* A reserved value.
 CONSTANTS Nil
@@ -111,7 +112,7 @@ VARIABLES config,         \* The current configuration
           pending_ack,    \* The log entries pending an ack to the client
           log,            \* A sequence of log entries that makes the Raft log.
           hwm,            \* The offset of the latest entry in the log the state machine may apply.
-          votes_granted,  \* The set of servers from which the candidate has received a vote in its
+          votes_recv,     \* The set of servers from which the candidate has received a vote in its
                           \* current_epoch.
           flwr_end_offset \* The latest entry that each follower has acknowledged is the same as the
                           \* leader's. This is used to calculate high watermark on the leader.
@@ -128,7 +129,7 @@ VARIABLES aux_ctrs,       \* A set of counters used for state-space control.
 \* variable groupings (useful for UNCHANGED)
 logVars == <<log, hwm>>
 serverVars == <<config, current_epoch, role, state, voted_for, leader, pending_fetch, pending_ack>>
-candidateVars == <<votes_granted>>
+candidateVars == <<votes_recv>>
 leaderVars == <<flwr_end_offset>>
 invVars == <<inv_sent, inv_pos_acked, inv_neg_acked >>
 auxVars == <<aux_ctrs, aux_disk_id_gen>>
