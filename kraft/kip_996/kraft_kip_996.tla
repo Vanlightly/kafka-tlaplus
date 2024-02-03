@@ -110,20 +110,25 @@ CrashLoseState(s) ==
     ACTION: CheckQuorumResign -------------------------------------
     Server (s) is a leader but resigns because it cannot receive 
     fetch requests from enough followers to consitute a functional
-    majority.
+    majority. This happens either due to enough followers being
+    disconnected or no longer believing this server is the leader.
     
     This is only enabled when checking liveness.
 *)
 CheckQuorumResign(s) ==
-    /\ TestLiveness = TRUE
     /\ s \in StartedServers
     /\ state[s] = Leader
     /\ LET connected_peers == Quantify(config[s].members, LAMBDA peer :
                                         /\ s # peer
-                                        /\ Connected(s, peer))
+                                        /\ Connected(s, peer)
+                                        /\ leader[peer] = s)
            min_connected == Cardinality(config[s].members) \div 2
-           new_state     == TransitionToResigned(s)
-       IN /\ connected_peers < min_connected
+           new_state     == IF role[s] = Voter
+                            THEN TransitionToResigned(s)
+                            ELSE TransitionToUnattached(s, current_epoch[s], Observer)
+       IN /\ \/ /\ TestLiveness = TRUE
+                /\ connected_peers < min_connected
+             \/ TestLiveness = FALSE
           /\ ApplyState(s, new_state)
     /\ UNCHANGED <<NetworkVars, server_ids, role, config, current_epoch,
                    pending_fetch, pending_ack, invVars, leaderVars,
@@ -294,7 +299,7 @@ HandlePreVoteRequest(s) ==
                /\ IF error = Nil
                   THEN Reply(m, [type         |-> RequestVoteResponse,
                                  epoch        |-> m.epoch,
-                                 leader       |-> IF grant THEN Nil \* TODO!!
+                                 leader       |-> IF grant THEN Nil \* KIP-996 TODO!!
                                                   ELSE state0.leader,
                                  vote_granted |-> grant,
                                  pre_vote     |-> TRUE,

@@ -168,9 +168,9 @@ HasConsistentLeader(s, leader_id, epoch) ==
     IF leader_id = s
     THEN IF /\ current_epoch[s] = epoch 
             /\ \/ role[s] = Observer 
-               \/ state[s] = Resigned
-         THEN \* no conflict, the server has resigned after either restarting 
-              \* or being removed as leader of this same epoch.
+               \/ state[s] \in { Resigned, Prospective } \* KIP-996
+         THEN \* no conflict, the server has resigned after either restarting, 
+              \* been removed as leader or become prospective of this same epoch.
               TRUE 
          ELSE \* if the peer thinks I am leader, and I am really leader
               \* then TRUE, else FALSE
@@ -188,7 +188,8 @@ SetIllegalState ==
     [state        |-> IllegalState,
      epoch        |-> 0, 
      leader       |-> Nil,
-     votes_recv   |-> {}]
+     votes_recv   |-> {},
+     voted_for    |-> Nil]
 
 NoTransition(s) ==
     (* Creates a record with current values.*)
@@ -217,7 +218,7 @@ TransitionToUnattached(s, epoch, curr_role) ==
           yet learned who the new leader is. 
         - An observer has received a NotLeader fetch response .*)
     IF /\ curr_role = Voter
-       /\ current_epoch[s] = epoch
+       /\ epoch <= current_epoch[s]
     THEN SetIllegalState
     ELSE [state        |-> Unattached, 
           epoch        |-> epoch, 
@@ -227,9 +228,12 @@ TransitionToUnattached(s, epoch, curr_role) ==
      
 TransitionToFollower(s, leader_id, epoch) ==
     (* The follower has learned who the leader is in this epoch *)
-    IF /\ current_epoch[s] = epoch
-       /\ \/ state[s] = Follower
-          \/ state[s] = Leader
+    IF \/ leader_id = s
+       \/ /\ current_epoch[s] = epoch
+          /\ \/ state[s] = Follower
+             \/ state[s] = Leader
+       \/ epoch < current_epoch[s]
+\*       \/ leader_id \notin config[s].members TODO later, check this works with reconfig
     THEN SetIllegalState
     ELSE [state        |-> Follower, 
           epoch        |-> epoch,
@@ -240,18 +244,22 @@ TransitionToFollower(s, leader_id, epoch) ==
                            THEN Nil ELSE voted_for[s]]
           
 TransitionToLeader(s) ==
-    [state        |-> Leader, 
-     epoch        |-> current_epoch[s],
-     leader       |-> s,
-     votes_recv   |-> {},
-     voted_for    |-> voted_for[s]] \* don't forget prior vote
+    IF state[s] # Candidate
+    THEN SetIllegalState
+    ELSE [state        |-> Leader, 
+          epoch        |-> current_epoch[s],
+          leader       |-> s,
+          votes_recv   |-> {},
+          voted_for    |-> voted_for[s]] \* don't forget prior vote
      
 TransitionToResigned(s) ==
-    [state        |-> Resigned, 
-     epoch        |-> current_epoch[s],
-     leader       |-> Nil,
-     votes_recv   |-> {},
-     voted_for    |-> voted_for[s]]  \* don't forget prior vote
+    IF state[s] # Leader
+    THEN SetIllegalState
+    ELSE [state        |-> Resigned, 
+          epoch        |-> current_epoch[s],
+          leader       |-> Nil,
+          votes_recv   |-> {},
+          voted_for    |-> voted_for[s]]  \* don't forget prior vote
      
 TransitionToProspective(s) ==
     (* Transitioning to Prospective and sending pre-votes occur
@@ -324,7 +332,11 @@ MaybeHandleCommonResponse(s, leader_id, epoch, errors) ==
       \* CASE 3) become a follower -----------------------
       [] /\ epoch = current_epoch[s]
          /\ leader_id # Nil
-         /\ leader[s] = Nil ->
+         /\ leader[s] = Nil
+         /\ leader_id # s -> \* KIP-966, see comment below
+                \* 4th criteria added as a resigned leader could now be 
+                \* a prospective in same epoch and get a response
+                \* from a peer saying that it is the leader in this epoch
                 TransitionToFollower(s, leader_id, epoch) @@
                      [handled |-> TRUE, 
                       error   |-> errors]
