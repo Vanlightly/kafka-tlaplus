@@ -456,5 +456,6 @@ LeaderHasCommittedOffsetsInCurrentEpoch(s) ==
     \E offset \in DOMAIN log[s] :
         /\ log[s][offset].epoch = current_epoch[s]
         /\ hwm[s] >= offset
+
         
 ================================================

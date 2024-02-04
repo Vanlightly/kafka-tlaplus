@@ -72,16 +72,24 @@ ClusterStuck(crash_server) ==
        Detects whether losing this server will result in a cluster
        unable to make further progress due to only a minority being
        functional.
+       
+       Tries to find a server such that when the crash server is
+       taken offline, the still forms a majority set of servers
+       where in an election it the server could win. If none exists,
+       then don't crash this server.
     *)
-    ~\E s \in StartedServers :
-        /\ role[s] = Voter
-        /\ s # crash_server
-        /\ Quantify(config[s].members, LAMBDA peer :
-            /\ peer # crash_server          \* not crash server
-            /\ role[peer] = Voter           \* is a functioning voter
-            /\ s \in config[peer].members   \* agrees that s is a member
-            /\ Connected(s, peer))          \* the two are connected
-                > Cardinality(config[s].members) \div 2
+    IF TestLiveness = TRUE
+    THEN ~\E s \in StartedServers :
+            /\ role[s] = Voter
+            /\ s # crash_server
+            /\ Quantify(config[s].members, LAMBDA peer :
+                /\ peer # crash_server           \* not exclude_server
+                /\ role[peer] = Voter            \* is a functioning voter
+                /\ s \in config[peer].members    \* agrees that s is a member
+                /\ Len(log[s]) >= Len(log[peer]) \* could win election
+                /\ Connected(s, peer))           \* the two are connected
+                    > Cardinality(config[s].members) \div 2
+    ELSE TRUE
 
 CrashLoseState(s) ==
     \* enabling conditions
@@ -121,7 +129,16 @@ CheckQuorumResign(s) ==
     /\ LET connected_peers == Quantify(config[s].members, LAMBDA peer :
                                         /\ s # peer
                                         /\ Connected(s, peer)
-                                        /\ leader[peer] = s)
+                                        /\ \/ /\ role[peer] = Voter
+                                              /\ current_epoch[s] >= current_epoch[peer]
+\*                                              /\ current_epoch[s] = current_epoch[peer]
+\*                                              /\ \/ leader[peer] = s
+\*                                                 \/ voted_for[peer] = s
+                                           \/ role[peer] = Observer)
+\*                                              /\ \E m \in net_messages :
+\*                                                    /\ m.type = BeginQuorumRequest
+\*                                                    /\ m.dest = peer
+\*                                                    /\ m.epoch = current_epoch[s])
            min_connected == Cardinality(config[s].members) \div 2
            new_state     == IF role[s] = Voter
                             THEN TransitionToResigned(s)
@@ -202,19 +219,24 @@ VoterElectionTimeout(s) ==
 
 ValidObserverTimeout(s) ==
     IF TestLiveness
-    THEN \/ state[leader[s]] # Leader
-         \/ ~Connected(s, leader[s])
+    THEN LET peer == pending_fetch[s].dest
+         IN ~Connected(s, peer)
     ELSE TRUE
 
 ObserverFetchTimeout(s) ==
     /\ s \in StartedServers
     /\ role[s] = Observer
-    /\ state[s] = Follower
-    /\ leader[s] # Nil
+    /\ pending_fetch[s] # Nil
     /\ ValidObserverTimeout(s)
+\*    /\ \/ /\ state[s] = Follower
+\*          /\ leader[s] # Nil
+\*          /\ ValidObserverTimeout(s)
+\*       \/ /\ state[s] = Unattached
+\*          /\ pending_fetch[s] # Nil
     /\ ApplyState(s, TransitionToUnattached(s, current_epoch[s], role[s]))
+    /\ pending_fetch' = [pending_fetch EXCEPT ![s] = Nil]
     /\ UNCHANGED <<server_ids, config, role, pending_ack, flwr_end_offset, 
-                   pending_fetch, logVars, invVars, auxVars, NetworkVars>>                   
+                   logVars, invVars, auxVars, NetworkVars>>                   
 
 (*
     ACTION: RequestPreVote -----------------------------------------------
@@ -604,25 +626,27 @@ SendFetchRequest(s) ==
     /\ s \in StartedServers
     /\ \E peer \in StartedServers : 
         /\ s # peer
+        /\ pending_fetch[s] = Nil
         /\ \* either the follower (voter or observer) knows who the 
            \* leader is and can send a fetch request to the leader
            \/ /\ leader[s] = peer
               /\ state[s] = Follower
-           \* or we're an observer follower that doesn't know who the
-           \* leader is and picks a random voter to fetch from, knowing
-           \* that if it isn't the leader, it will include the leader id
-           \* in its response if it knows.
+           \* or we're an observer that doesn't know who the leader 
+           \* is (either unattached or voted) and picks a random voter to
+           \* fetch from, knowing that if it isn't the leader, it will
+           \* include the leader id in its response if it knows.
            \/ /\ role[s] = Observer
-              /\ state[s] = Unattached
+              /\ state[s] \in {Unattached, Voted}
+              /\ Connected(s, peer)
               \* CHEATING, to prevent a cycle of always sending it to a 
               \* server that is not the leader and doesn't know who the
-              \* leader is. In reality, who this server sends a fetch request
+              \* leader is, choose a voter that does know. 
+              \* In reality, who this server sends a fetch request
               \* to is governed by a voter set in configuration. This spec
               \* assumes that the server is given the set of voters it can
               \* send its first fetch to.
               /\ role[peer] = Voter
               /\ leader[peer] # Nil
-        /\ pending_fetch[s] = Nil
         \* state mutations
         /\ LET last_log_offset == Len(log[s])
                last_log_epoch  == IF last_log_offset > 0 
@@ -1016,6 +1040,21 @@ AddVoterCheck(s, add_server) ==
       [] HasPendingConfigCommand(s) -> ReconfigInProgress
       [] ~LeaderHasCommittedOffsetsInCurrentEpoch(s) -> LeaderNotReady
       [] OTHER -> Ok
+      
+AddVoterLivenessCondition(s, add_server) ==
+    (* When testing liveness, don't add a server such that it causes
+       the leader to lose a functioning majority. For example, the add
+       server already crashed, and with only 2 live members out of 4,
+       and this server having the largest log, only it can get elected
+       but also it doesn't have a majority, so the cluster gets stuck. *)
+    IF TestLiveness = TRUE
+    THEN LET new_member_count == Cardinality(config[s].members) + 1
+             connected_members == ConnectedServers(s, config[s].members)
+             add_connected     == IF Connected(s, add_server)
+                                  THEN 1 ELSE 0
+         IN (connected_members + add_connected)
+                > (new_member_count \div 2)
+    ELSE TRUE  
 
 AcceptAddVoterRequest(s) ==
     \* enabling conditions
@@ -1023,6 +1062,7 @@ AcceptAddVoterRequest(s) ==
     /\ s \in StartedServers
     /\ \E add_server \in StartedServers :
         /\ AddVoterCheck(s, add_server) = Ok
+        /\ AddVoterLivenessCondition(s, add_server)
         /\ Cardinality(config[s].members) < MaxClusterSize
         \* state mutations
         /\ LET entry   == [command |-> AddVoterCommand,
@@ -1072,6 +1112,17 @@ RemoveVoterCheck(s, peer) ==
       [] HasPendingConfigCommand(s) -> ReconfigInProgress
       [] ~LeaderHasCommittedOffsetsInCurrentEpoch(s) -> LeaderNotReady
       [] OTHER -> Ok
+      
+RemoveVoterLivenessCondition(s, remove_server) ==
+    (* When testing liveness, don't remove a voter if that would
+       result in the leader losing a majority and getting stuck. *)
+    IF TestLiveness = TRUE
+    THEN Quantify(config[s].members, LAMBDA peer :
+            /\ peer # remove_server         \* not remove_server
+            /\ role[peer] = Voter           \* is a functioning voter
+            /\ Connected(s, peer))          \* the two are connected
+                > Cardinality(config[s].members) \div 2
+    ELSE TRUE      
 
 AcceptRemoveVoterRequest(s) ==
     \* enabling conditions
@@ -1079,6 +1130,7 @@ AcceptRemoveVoterRequest(s) ==
     /\ s \in StartedServers 
     /\ \E remove_server \in StartedServers :
         /\ RemoveVoterCheck(s, remove_server) = Ok
+        /\ RemoveVoterLivenessCondition(s, remove_server)
         /\ Cardinality(config[s].members) > MinClusterSize
         \* state mutations
         /\ LET entry      == [command |-> RemoveVoterCommand,

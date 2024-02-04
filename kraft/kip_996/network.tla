@@ -74,8 +74,6 @@ ChangeConnectivity(dead_servers) ==
            THEN \E pair \in disconnected_pairs :
                     net_connectivity[pair] = TRUE
            ELSE TRUE
-\*        /\ disconnected # { pair \in DOMAIN net_connectivity : 
-\*                                net_connectivity[pair] = FALSE } 
         /\ net_connectivity' = [pair \in DOMAIN net_connectivity |->
                                     IF pair \in disconnected_pairs
                                     THEN FALSE
@@ -86,42 +84,6 @@ ChangeConnectivity(dead_servers) ==
                         /\ m.dest \in pair})
     /\ net_connectivity_ctr' = net_connectivity_ctr + 1
     
-\*    
-\*    \* If, due to the number of dead servers, we are already past the
-\*    \* disconnected pair limit, and there are disconnected pairs which
-\*    \* have no dead server, then restore them.
-\*    /\ IF /\ Quantify(DOMAIN net_connectivity, LAMBDA pair :
-\*                    PairMatch(dead_servers, pair) >= MaxDisconnectedPairs
-\*          /\ \E pair \in DOMAIN net_connectivity :
-\*                    /\ net_connectivity[pair] = FALSE
-\*                    /\ PairMatch(dead_servers, pair) = FALSE
-\*       THEN net_connectivity' = [pair \in DOMAIN net_connectivity |->
-\*                                        IF DeadInPair(dead_servers, pair)
-\*                                        THEN FALSE
-\*                                        ELSE TRUE]
-\*       \* Else, choose a new disconnected pair set, which when combined
-\*       \* with dead servers, does not breach the disconnected pair count.
-\*       ELSE \E disconnected \in SUBSET DOMAIN net_connectivity :
-\*                \* the disconnected pairs must include any pairs with a dead server
-\*                /\ PairsMatch(dead_servers, disconnected)
-\*                /\ ~\E pair \in DOMAIN net_connectivity :
-\*                    /\ PairMatch(dead_servers, pair)
-\*                    /\ pair \notin disconnected
-\*                \* cannot have more disconnected pairs than the max
-\*                /\ Cardinality(disconnected) <= MaxDisconnectedPairs
-\*                \* make sure the new disconnected set is different to the current
-\*                /\ disconnected # { pair \in DOMAIN net_connectivity : 
-\*                                        net_connectivity[pair] = FALSE } 
-\*                /\ net_connectivity' = [pair \in DOMAIN net_connectivity |->
-\*                                            IF pair \in disconnected
-\*                                            THEN FALSE
-\*                                            ELSE TRUE]
-\*                /\ Drop({m \in net_messages : 
-\*                            \E pair \in disconnected :
-\*                                /\ m.source \in pair
-\*                                /\ m.dest \in pair})
-\*    /\ net_connectivity_ctr' = net_connectivity_ctr + 1
-       
 \* ======================================================================
 \* ----- Message passing ------------------------------------------------
 
@@ -133,10 +95,12 @@ Connected(s1, s2) ==
         /\ net_connectivity[pair] = TRUE
     
 ConnectedServers(target, servers) ==
-    Quantify(servers, LAMBDA s : 
-                        \E pair \in DOMAIN net_connectivity :
+    1 + Quantify(servers, LAMBDA s : 
+                        /\ s # target
+                        /\ \E pair \in DOMAIN net_connectivity :
                             /\ target \in pair
-                            /\ s \in pair) + 1
+                            /\ s \in pair
+                            /\ net_connectivity[pair] = TRUE)
 
 ConnectedMajority(target, servers) ==
     ConnectedServers(target, servers) > Cardinality(servers) \div 2
