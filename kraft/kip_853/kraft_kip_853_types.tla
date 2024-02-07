@@ -8,33 +8,40 @@ EXTENDS FiniteSets, FiniteSetsExt, Sequences, SequencesExt, Integers, TLC,
 
 \* The initial cluster size (the size can change over time 
 \* due to reconfigurations)
-CONSTANTS InitClusterSize, MinClusterSize, MaxClusterSize
+CONSTANTS InitClusterSize, 
+          MinClusterSize,   \* reconfigs are limited to cluster sizes >= this value
+          MaxClusterSize    \* reconfigs are limited to cluster sizes <= this value
 
-\* The set of server IDs
-CONSTANTS Hosts
+\* The set of hosts that KRaft servers are deployed on.
+\* Not super important as server ids have composite ids based on
+\* host and a disk id. The spec expects a value to correspond to
+\* the InitClusterSize. For example, InitClusterSize=3 and
+\* Hosts={h1, h2, h3}
+CONSTANTS Hosts             
 
-\* The set of requests that can go into the log
+\* The set of values that can go be written to the log
 CONSTANTS Value
 
-\* Server roles
+\* Server roles. 
 CONSTANTS Voter,   \* A full Raft participant
           Observer \* Non-voting server that can only maintain
                    \* a log replica.
 
 \* Server states.
-CONSTANTS Unattached, \* voter or observer, leader unknown
-          Follower,   \* voter or observer, leader known and can fetch data  
-          Candidate,  \* started an election
-          Leader,     \* won an election and
-          Voted,      \* voted in an election but does not yet know the result
-          Resigned,   \* the leader has abdicated
-          DeadNoState \* the server has died, losing all state
+CONSTANTS Unattached,  \* Voter or observer, but leader unknown.
+          Follower,    \* Voter or observer, leader known.
+          Candidate,   \* Has started an election
+          Leader,      \* Has won an election
+          Voted,       \* Voted in an election but does not yet know the result
+          Resigned,    \* Has abdicated as leader.
+          DeadNoState  \* Has died, losing all state
 
 \* Commands
 CONSTANTS AppendCommand,        \* contains a client value
           InitClusterCommand,   \* contains the initial configuration
-          AddServerCommand,     \* reconfiguration command to add a server
-          RemoveServerCommand   \* reconfiguration command to remove a server
+          AddVoterCommand,      \* reconfiguration command to add a voter
+          RemoveVoterCommand,   \* reconfiguration command to remove a voter
+          LeaderChangeRecord
 
 \* A reserved value.
 CONSTANTS Nil
@@ -47,10 +54,11 @@ CONSTANTS UnknownMember, AlreadyMember, ReconfigInProgress, LeaderNotReady,
           FencedLeaderEpoch, NotLeader, UnknownLeader
 
 \* Message types:
-CONSTANTS RequestVoteRequest, RequestVoteResponse,
+CONSTANTS RequestVoteRequest,
+          RequestVoteResponse,
           BeginQuorumRequest,
-          FetchRequest, FetchResponse,
-          JoinRequest, JoinResponse
+          FetchRequest,
+          FetchResponse
 
 \* Used for filtering messages under different circumstances
 CONSTANTS AnyEpoch, EqualEpoch
@@ -59,17 +67,18 @@ CONSTANTS AnyEpoch, EqualEpoch
 CONSTANTS IllegalState       
 
 \* Limiting state space when model checking           
-CONSTANTS MaxElections,          \* Limits the number of elections
-          MaxValuesPerEpoch,     \* Limits the number of log entries per epoch
-          MaxCrashes,            \* Limits the number of crashes with loss of state
+CONSTANTS MaxEpoch,              \* Limits the number of elections when not testing liveness.
+          MaxValuesPerEpoch,     \* Limits the number of log entries per epoch.
+          MaxCrashes,            \* Limits the number of crashes with loss of state.
           MaxRestarts,           \* Limits the number of restarts without loss of state
-          MaxAddReconfigs,       \* Limits the number of add server reconfigurations
-          MaxRemoveReconfigs,    \* Limits the number of remove server reconfigurations
-          MaxSpawnedServers      \* Limits the number of servers ever started. If MaxSpawnedServers
-                                 \* is larger than the cluster size, it will allow observers
-                                 \* to start-up which act as non-voting followers (i.e they
-                                 \* replicate data from the leader only).
+          MaxAddReconfigs,       \* Limits the number of add voter reconfigurations
+          MaxRemoveReconfigs,    \* Limits the number of remove voter reconfigurations
+          MaxSpawnedServers      \* Limits the number of servers ever started. 
+                                 \* See readme for more details.
 
+CONSTANTS TestLiveness  \* See the Liveness section in the readme for more details.
+
+ASSUME MaxEpoch \in Nat
 ASSUME InitClusterSize \in Nat
 ASSUME MinClusterSize \in Nat
 ASSUME MaxClusterSize \in Nat
@@ -102,7 +111,7 @@ VARIABLES config,         \* The current configuration
           pending_ack,    \* The log entries pending an ack to the client
           log,            \* A sequence of log entries that makes the Raft log.
           hwm,            \* The offset of the latest entry in the log the state machine may apply.
-          votes_granted,  \* The set of servers from which the candidate has received a vote in its
+          votes_recv,     \* The set of servers from which the candidate has received a vote in its
                           \* current_epoch.
           flwr_end_offset \* The latest entry that each follower has acknowledged is the same as the
                           \* leader's. This is used to calculate high watermark on the leader.
@@ -119,13 +128,15 @@ VARIABLES aux_ctrs,       \* A set of counters used for state-space control.
 \* variable groupings (useful for UNCHANGED)
 logVars == <<log, hwm>>
 serverVars == <<config, current_epoch, role, state, voted_for, leader, pending_fetch, pending_ack>>
-candidateVars == <<votes_granted>>
+candidateVars == <<votes_recv>>
 leaderVars == <<flwr_end_offset>>
 invVars == <<inv_sent, inv_pos_acked, inv_neg_acked >>
 auxVars == <<aux_ctrs, aux_disk_id_gen>>
 vars == <<server_ids, NetworkVars, serverVars, candidateVars, leaderVars, logVars,
           invVars, auxVars>>
 view == <<server_ids, NetworkView, serverVars, candidateVars, leaderVars, logVars, invVars>>
+livenessView == <<server_ids, NetworkView, serverVars, candidateVars,
+                  leaderVars, logVars, invVars, auxVars>>
 
 \* defines the symmetry sets
 symmHosts == Permutations(Hosts)
@@ -137,7 +148,6 @@ StartedServers == DOMAIN server_ids \* started includes ever started ie. include
 
 (* 
     The counters of aux_ctrs:
-    - election_ctr         : the number of elections that have occurred.
     - value_ctr            : function of the number of values added per epoch.
     - crash_ctr            : the number of server crashes that have occurred.
     - restart_ctr          : the number of server restarts that have occurred.

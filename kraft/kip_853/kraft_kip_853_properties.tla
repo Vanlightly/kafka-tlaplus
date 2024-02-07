@@ -4,7 +4,6 @@ EXTENDS FiniteSets, FiniteSetsExt, Sequences, SequencesExt, Integers, TLC,
         kraft_kip_853_functions,
         network
 
-
 \*================================================
 \* Invariants (safety properties)
 \*================================================
@@ -44,7 +43,7 @@ NoLogDivergence ==
                ELSE TRUE
 
 \* INV: StatesMatchRoles
-\* Ensures that the combination of state and role remains consistent
+\* Ensures that the combination of state and role remains consistent.
 StatesMatchRoles ==    
     \A s \in StartedServers :
         /\ role[s] = Observer => state[s] \in ObserverStates
@@ -52,7 +51,8 @@ StatesMatchRoles ==
 
 \* INV: NeverTwoLeadersInSameEpoch
 \* We cannot have two servers having a conflicting
-\* view on who the leader is in the same epoch    
+\* view on who the leader is in the same epoch.
+
 NeverTwoLeadersInSameEpoch ==    
     ~\E s1, s2 \in StartedServers :
         /\ s1 # s2
@@ -82,7 +82,8 @@ LeaderHasAllAckedValues ==
             /\ ~ValueInServerLog(s, v)
 
 \* INV: AckedValueNotLost
-\* An acknowledged value must exist on at least one server
+\* An acknowledged value must exist on at least one 
+\* live functioning voter server.
 
 AckedValueNotLost ==
     \A v \in inv_pos_acked :
@@ -90,50 +91,36 @@ AckedValueNotLost ==
             /\ role[s] = Voter
             /\ ValueInServerLog(s, v)
 
+ValidVotesRecv ==
+    \A s \in StartedServers :
+        Cardinality(votes_recv[s]) > 0 => 
+            state[s] = Candidate
+
 \* INV: Used in debugging
 TestInv ==
     TRUE
-\*    Quantify(DOMAIN net_connectivity, LAMBDA p : net_connectivity[p] = TRUE)
-\*        >= 2
-                
 
 \*================================================
 \* Liveness properties
 \*================================================
 
-\* Note that due to the number of elections being limited,
-\* the last possible election could fail to elect a leader 
-\* which will prevent progress, so these liveness formulas 
-\* only apply in cases where the behaviour does not end 
-\* with all elections used up and no elected leader in 
-\* the current configuration. There doesn't seem to be any
-\* way to avoid this.
-
-NoProgressPossible ==
-    \* no more elections will occur
-    /\ aux_ctrs.election_ctr = MaxElections
-    \* and, the current epoch cannot make further progress
-    /\ ~\E s \in StartedServers : 
-        /\ state[s] = Leader
-        /\ \E peer \in StartedServers : 
-            /\ state[peer] = Voter
-            /\ s \in config[peer].members
-
-
 \* LIVENESS: ValuesEventuallyAcked -----------------
 \* A client value will eventually get positively or negatively
-\* acknowledged, or the election limit is reached without a leader.
+\* acknowledged. Detects a value that gets stuck.
 
 ValuesEventuallyAcked ==
     \A v \in Value :
-        (v \in inv_sent) ~> (\/ NoProgressPossible
-                             \/ v \in inv_neg_acked
-                             \/ v \in inv_pos_acked)
+        (v \in inv_sent) ~> (\/ /\ v \in inv_neg_acked
+                                /\ v \notin inv_pos_acked
+                             \/ /\ v \in inv_pos_acked
+                                /\ v \notin inv_neg_acked)
 
 \* LIVENESS: ReconfigurationCompletes -----------
 \* A reconfiguration command will either get committed and be
-\* fully replicated or it will be truncated and
-\* not be found on any server log.
+\* fully replicated or it will be truncated and not be found on
+\* any (connected/alive) server log. Detects a reconfiguration
+\* that gets stuck.
+
 ConfigNotInServerLog(s, config_id) ==
     ~\E offset \in DOMAIN log[s] :
         /\ IsConfigCommand(log[s], offset)
@@ -146,15 +133,37 @@ ConfigInServerLogAndCommitted(s, config_id) ==
         /\ hwm[s] >= offset
 
 ConfigAllOrNothing(config_id) ==
-    IF NoProgressPossible
-    THEN TRUE
-    ELSE \E s \in StartedServers : 
-            /\ IsCurrentLeader(s)
-            /\ \/ \A s1 \in config[s].members : ConfigInServerLogAndCommitted(s, config_id)
-               \/ \A s1 \in config[s].members : ConfigNotInServerLog(s, config_id)
+    \E s \in StartedServers : 
+        /\ IsCurrentLeader(s)
+        /\ \/ \A s1 \in config[s].members : 
+                \/ ConfigInServerLogAndCommitted(s, config_id)
+                \/ ~Connected(s, s1)
+                \/ state[s1] = DeadNoState
+           \/ \A s1 \in config[s].members : 
+                \/ ConfigNotInServerLog(s, config_id)
+                \/ ~Connected(s, s1)
+                \/ state[s1] = DeadNoState
 
 ReconfigurationNotStuck ==
     \A config_id \in 1..(MaxAddReconfigs + MaxRemoveReconfigs) :
         []<>ConfigAllOrNothing(config_id)
+
+\* LIVENESS: EventuallyLeaderElected -----------
+\* If a state is reached where there is no functional leader,
+\* then this state will lead to a state where a functional
+\* leader does exist. Detects a cluster that gets stuck
+\* due to being unable to elect a leader.
+    
+FunctionalLeaderExists ==
+    \E s \in StartedServers : 
+        /\ state[s] = Leader
+        /\ Quantify(StartedServers, LAMBDA s1 : /\ role[s1] = Voter
+                                                /\ leader[s1] = s
+                                                /\ s \in config[s1].members) 
+              >= MajorityCount(config[s].members)
+   
+        
+EventuallyLeaderElected ==
+      ~FunctionalLeaderExists ~> FunctionalLeaderExists      
         
 ================================================

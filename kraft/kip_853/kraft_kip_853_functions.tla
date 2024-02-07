@@ -37,6 +37,9 @@ Quorum(ensemble) ==
     *)
     {i \in SUBSET(ensemble) : Cardinality(i) * 2 > Cardinality(ensemble)}
 
+MajorityCount(ensemble) ==
+    (Cardinality(ensemble) \div 2) + 1
+
 LastEpoch(xlog) == 
     (*
         The epoch of the last entry in a log, or 0 if the log is empty.
@@ -66,63 +69,65 @@ CompareEntries(offset1, epoch1, offset2, epoch2) ==
       [] epoch1 = epoch2 /\ offset1 = offset2 -> 0
       [] OTHER -> -1
 
-HighestCommonOffset(i, end_offset_for_epoch, epoch) ==
+HighestCommonOffset(s, end_offset_for_epoch, epoch) ==
     (* 
         Finds the highest offset in the log which
-        is <= to the supplied epoch and its last offset
+        is <= to the supplied epoch and its end_offset_for_epoch
+        (where the end_offset_for_epoch is inclusive here).
     *)
       \* CASE 1) the log is empty so no common offset
-    CASE log[i] = <<>> -> 
+    CASE log[s] = <<>> -> 
             [offset |-> 0, epoch |-> 0]
       \* CASE 2) there is no lower entry in the log, so no common offset
-      [] ~\E offset \in DOMAIN log[i] :
-            CompareEntries(offset, log[i][offset].epoch, 
+      [] ~\E offset \in DOMAIN log[s] :
+            CompareEntries(offset, log[s][offset].epoch, 
                            end_offset_for_epoch, epoch) <= 0 -> 
             [offset |-> 0, epoch |-> 0]
       \* CASE 3) there is a common entry, so choose the highest one 
       [] OTHER ->
-            LET offset == CHOOSE offset \in DOMAIN log[i] :
-                            /\ CompareEntries(offset, log[i][offset].epoch, 
+            LET offset == CHOOSE offset \in DOMAIN log[s] :
+                            /\ CompareEntries(offset, log[s][offset].epoch, 
                                               end_offset_for_epoch, epoch) <= 0
-                            /\ ~\E offset2 \in DOMAIN log[i] :
-                                /\ CompareEntries(offset2, log[i][offset2].epoch, 
+                            /\ ~\E offset2 \in DOMAIN log[s] :
+                                /\ CompareEntries(offset2, log[s][offset2].epoch, 
                                                   end_offset_for_epoch, epoch) <= 0
                                 /\ offset2 > offset
-            IN [offset |-> offset, epoch |-> log[i][offset].epoch]  
+            IN [offset |-> offset, epoch |-> log[s][offset].epoch]  
 
-TruncateLog(i, m) ==
+TruncateLog(s, m) ==
     (* 
         Create a new log, truncated to the highest common entry
     *)
     LET highest_common_offset == HighestCommonOffset(
-                                    i,
-                                    m.diverging_end_offset,
+                                    s,
+                                    m.diverging_end_offset - 1,
                                     m.diverging_epoch)
     IN IF highest_common_offset.offset = 0
        THEN <<>>
-       ELSE [offset \in 1..highest_common_offset.offset |-> log[i][offset]]
+       ELSE [offset \in 1..highest_common_offset.offset |-> log[s][offset]]
 
-EndOffsetForEpoch(i, last_fetched_epoch) ==
+EndOffsetForEpoch(s, last_fetched_epoch) ==
     (*
         The highest offset in the leader's log that has the same or lower epoch.
+        Returns an inclusive offset.
     *)
       \* CASE 1) the log is empty so no end offset
-    CASE log[i] = <<>> -> 
+    CASE log[s] = <<>> -> 
             [offset |-> 0, epoch |-> 0]
       \* CASE 2) there is no entry at or below the epoch in the log, so no end offset
-      [] ~\E offset \in DOMAIN log[i] :
-            log[i][offset].epoch <= last_fetched_epoch -> 
+      [] ~\E offset \in DOMAIN log[s] :
+            log[s][offset].epoch <= last_fetched_epoch -> 
             [offset |-> 0, epoch |-> 0]
       \* CASE 3) there is an entry at or below the epoch in the log,
       \*         so return the highest one
       [] OTHER ->
-            LET offset == CHOOSE offset \in DOMAIN log[i] :
-                            /\ log[i][offset].epoch <= last_fetched_epoch
-                            /\ ~\E offset2 \in DOMAIN log[i] :
-                                /\ log[i][offset2].epoch <= last_fetched_epoch
+            LET offset == CHOOSE offset \in DOMAIN log[s] :
+                            /\ log[s][offset].epoch <= last_fetched_epoch
+                            /\ ~\E offset2 \in DOMAIN log[s] :
+                                /\ log[s][offset2].epoch <= last_fetched_epoch
                                 /\ offset2 > offset
-            IN [offset |-> offset + 1, 
-                epoch  |-> log[i][offset].epoch] 
+            IN [offset |-> offset, 
+                epoch  |-> log[s][offset].epoch] 
 
 ValidFetchPosition(s, m) ==
     (*
@@ -131,14 +136,15 @@ ValidFetchPosition(s, m) ==
     *)
     \/ m.fetch_offset = 1
     \/ LET end == EndOffsetForEpoch(s, m.last_fetched_epoch)
-       IN /\ m.fetch_offset <= end.offset
+       IN \* it's ok to ask for the next highest offset even if it doesn't yet exist
+          /\ m.fetch_offset <= end.offset + 1
           /\ m.last_fetched_epoch = end.epoch
 
 \* Transition helpers ------------------------------
 
-HasConsistentLeader(i, leader_id, epoch) ==
+HasConsistentLeader(s, leader_id, epoch) ==
     (*
-        TRUE if server i and the peer have a consistent view on leadership,
+        TRUE if server s and the peer have a consistent view on leadership,
         FALSE if not.
         TODO: 
             v3.2.0 Note: 3.2.0 has a bug which may not be possible
@@ -159,40 +165,41 @@ HasConsistentLeader(i, leader_id, epoch) ==
         Therefore this formula has been modified for reconfiguration
         to ignore this case.
     *)
-    IF leader_id = i
-    THEN IF /\ current_epoch[i] = epoch 
-            /\ \/ role[i] = Observer 
-               \/ state[i] = Resigned
-         THEN \* no conflict, the server has resigned after either restarting 
-              \* or being removed as leader of this same epoch.
+    IF leader_id = s
+    THEN IF /\ current_epoch[s] = epoch 
+            /\ \/ role[s] = Observer 
+               \/ state[s] = Resigned
+         THEN \* no conflict, the server has resigned after either restarting, 
+              \* been removed as leader or become prospective of this same epoch.
               TRUE 
          ELSE \* if the peer thinks I am leader, and I am really leader
               \* then TRUE, else FALSE
-              state[i] = Leader
+              state[s] = Leader
     ELSE \* either the peer doesn't know there is a leader, or this
          \* node doesn't know a leader, or both agree on the same leader,
          \* or they have different epochs
-         \/ epoch # current_epoch[i]
+         \/ epoch # current_epoch[s]
          \/ leader_id = Nil
-         \/ leader[i] = Nil
-         \/ leader[i] = leader_id
+         \/ leader[s] = Nil
+         \/ leader[s] = leader_id
 
 SetIllegalState ==
     (* This will be picked up by an invariant. *)
     [state        |-> IllegalState,
      epoch        |-> 0, 
      leader       |-> Nil,
-     transitioned |-> TRUE]
+     votes_recv   |-> {},
+     voted_for    |-> Nil]
 
-NoTransition(i) ==
-    (* Creates a record with current values. Transitioned = FALSE
-       as no state transition has occurred. *)
-    [state        |-> state[i], 
-     epoch        |-> current_epoch[i], 
-     leader       |-> leader[i],
-     transitioned |-> FALSE]
+NoTransition(s) ==
+    (* Creates a record with current values.*)
+    [state        |-> state[s], 
+     epoch        |-> current_epoch[s], 
+     leader       |-> leader[s],
+     votes_recv   |-> votes_recv[s],
+     voted_for    |-> voted_for[s]]
 
-TransitionToVoted(i, epoch, state0) ==
+TransitionToVoted(epoch, state0, vote_recipient) ==
     (* The server has voted for a peer in this epoch and transitioned
        to Voted. The if statement is not really necessary here, but 
        this check exists in the code. *)
@@ -202,103 +209,167 @@ TransitionToVoted(i, epoch, state0) ==
     ELSE [state        |-> Voted,
           epoch        |-> epoch,
           leader       |-> Nil,
-          transitioned |-> TRUE]
+          votes_recv   |-> {},
+          voted_for    |-> vote_recipient]
 
-TransitionToUnattached(epoch) ==
-    (* The server has learned of a higher epoch but not
-       yet learned who the new leader is. *)
-    [state        |-> Unattached, 
-     epoch        |-> epoch, 
-     leader       |-> Nil,
-     transitioned |-> TRUE]
-    
-TransitionToFollower(i, leader_id, epoch) ==
+TransitionToUnattached(s, epoch, curr_role) ==
+    (* Either:
+        - A voter has learned of a higher epoch but not
+          yet learned who the new leader is. 
+        - An observer has received a NotLeader fetch response .*)
+    IF /\ curr_role = Voter
+       /\ epoch <= current_epoch[s]
+    THEN SetIllegalState
+    ELSE [state        |-> Unattached, 
+          epoch        |-> epoch, 
+          leader       |-> Nil,
+          votes_recv   |-> {},
+          voted_for    |-> Nil]  \* forget prior vote
+     
+TransitionToFollower(s, leader_id, epoch) ==
     (* The follower has learned who the leader is in this epoch *)
-    IF /\ current_epoch[i] = epoch
-       /\ \/ state[i] = Follower
-          \/ state[i] = Leader
+    IF \/ leader_id = s
+       \/ /\ current_epoch[s] = epoch
+          /\ \/ state[s] = Follower
+             \/ state[s] = Leader
+       \/ epoch < current_epoch[s]
+\*       \/ leader_id \notin config[s].members TODO later, check this works with reconfig
     THEN SetIllegalState
     ELSE [state        |-> Follower, 
-          epoch        |-> epoch, 
+          epoch        |-> epoch,
           leader       |-> leader_id,
-          transitioned |-> TRUE]
+          votes_recv   |-> {},
+          \* only forget prior vote if epoch bumped
+          voted_for    |-> IF epoch > current_epoch[s]
+                           THEN Nil ELSE voted_for[s]]
+          
+TransitionToLeader(s) ==
+    IF state[s] # Candidate
+    THEN SetIllegalState
+    ELSE [state        |-> Leader, 
+          epoch        |-> current_epoch[s],
+          leader       |-> s,
+          votes_recv   |-> {},
+          voted_for    |-> voted_for[s]] \* don't forget prior vote
+     
+TransitionToResigned(s) ==
+    IF state[s] # Leader
+    THEN SetIllegalState
+    ELSE [state        |-> Resigned, 
+          epoch        |-> current_epoch[s],
+          leader       |-> Nil,
+          votes_recv   |-> {},
+          voted_for    |-> voted_for[s]]  \* don't forget prior vote
+     
+TransitionToCandidate(s) ==
+    (* Transitioning to Candidate and sending vote requests occur
+       in the same action, so (s) added to votes_recv *)
+    [state        |-> Candidate, 
+     epoch        |-> current_epoch[s] + 1,
+     leader       |-> Nil,
+     votes_recv   |-> {s}, \* votes for itself
+     voted_for    |-> s]   \* votes for itself
 
-MaybeTransition(i, leader_id, epoch) ==
+MaybeTransition(s, leader_id, epoch) ==
     (*
         An event has occurred which may cause the server to
         transition to a new state. Returns a record with
         a new state, epoch and leader.  
     *)
-    CASE ~HasConsistentLeader(i, leader_id, epoch) ->
+    CASE ~HasConsistentLeader(s, leader_id, epoch) ->
             SetIllegalState
-      [] epoch > current_epoch[i] ->
+      [] epoch > current_epoch[s] ->
             \* the epoch of the server is stale, become a follower
             \* if the request contained the leader id, else become
             \* unattached
             IF leader_id = Nil
-            THEN TransitionToUnattached(epoch)
-            ELSE TransitionToFollower(i, leader_id, epoch)
+            THEN TransitionToUnattached(s, epoch, role[s])
+            ELSE TransitionToFollower(s, leader_id, epoch)
       []  /\ leader_id # Nil  \* message contains a leader id 
-          /\ leader[i] = Nil  \* this server doesn't know who the leader is
-          /\ leader_id # i    \* leader id of the message is not this server 
-                          ->
+          /\ leader[s] = Nil  \* this server doesn't know who the leader is
+          /\ leader_id # s ->  \* leader id of the message is not this server
             \* the request contained a leader id and this server does not know
             \* of a leader, so become a follower of that leader
-            TransitionToFollower(i, leader_id, epoch)
+            TransitionToFollower(s, leader_id, epoch)  
       [] OTHER ->
             \* no changes
-            NoTransition(i)
+            NoTransition(s)
 
-MaybeHandleCommonResponse(i, leader_id, epoch, errors) ==
+MaybeHandleCommonResponse(s, leader_id, epoch, errors) ==
     (*
         Common code between multiple response handlers:
         Note: 
-        - The Transitioned field indicates whether a state transition
-          happened. If TRUE then the parent action should update the 
-          corresponding variables.
         - The Handled field indicates whether action has already been
           taken. When TRUE, the parent action should do no more 
           processing of this response, only update the corresponding
           variables.
     *)
       \* CASE 1) stale epoch, do nothing ---------------
-    CASE epoch < current_epoch[i] ->
-                [state        |-> state[i],
-                 epoch        |-> current_epoch[i],
-                 leader       |-> leader[i],
-                 transitioned |-> FALSE,
+    CASE epoch < current_epoch[s] ->
+                [state        |-> state[s],
+                 epoch        |-> current_epoch[s],
+                 leader       |-> leader[s],
+                 votes_recv   |-> votes_recv[s],
+                 voted_for    |-> voted_for[s],
                  handled      |-> TRUE,
                  error        |-> errors]
       \* CASE 2) higher epoch or an error ---------------
-      [] \/ epoch > current_epoch[i] 
+      [] \/ epoch > current_epoch[s] 
          \/ errors \in { FencedLeaderEpoch, NotLeader } ->
-                MaybeTransition(i, leader_id, epoch) @@ 
+                MaybeTransition(s, leader_id, epoch) @@ 
                     [handled |-> TRUE, 
                      error   |-> errors]
       \* CASE 3) become a follower -----------------------
-      [] /\ epoch = current_epoch[i]
+      [] /\ epoch = current_epoch[s]
          /\ leader_id # Nil
-         /\ leader[i] = Nil ->
-                [state        |-> Follower, 
-                 leader       |-> leader_id,
-                 epoch        |-> current_epoch[i],
-                 transitioned |-> TRUE,
-                 handled      |-> errors # Nil,
-                 error        |-> errors]
+         /\ leader[s] = Nil 
+         /\ leader_id # s ->
+                TransitionToFollower(s, leader_id, epoch) @@
+                     [handled |-> TRUE, 
+                      error   |-> errors]
       \* CASE 4) no changes to state or leadership --------
       [] OTHER -> 
-                [state        |-> state[i],
-                 epoch        |-> current_epoch[i], 
-                 leader       |-> leader[i],
-                 transitioned |-> FALSE,
+                [state        |-> state[s],
+                 epoch        |-> current_epoch[s], 
+                 leader       |-> leader[s],
+                 votes_recv   |-> votes_recv[s],
+                 voted_for    |-> voted_for[s],
                  handled      |-> FALSE,
                  error        |-> errors]
+
+MaybeApplyChange(s, field, value) ==
+    IF field[s] # value
+    THEN field' = [field EXCEPT ![s] = value]
+    ELSE UNCHANGED field 
+
+ApplyState(s, new_state) ==
+    /\ MaybeApplyChange(s, state, new_state.state)
+    /\ MaybeApplyChange(s, leader, new_state.leader)
+    /\ MaybeApplyChange(s, current_epoch, new_state.epoch)
+    /\ MaybeApplyChange(s, votes_recv, new_state.votes_recv)
+    /\ MaybeApplyChange(s, voted_for, new_state.voted_for)
+
+UpdateFollowerEndOffsetMap(s, new_members) ==
+    (* Updates the server's follower end offset map with the
+       current set of members. Existing members keep their
+       current values, new members get set to 0. *)
+    flwr_end_offset' = [flwr_end_offset EXCEPT ![s] = 
+                            [s1 \in new_members |->
+                                IF s1 \in DOMAIN flwr_end_offset[s]
+                                THEN flwr_end_offset[s][s1]
+                                ELSE 0]]
+
+ResetFollowerEndOffsetMap(s, members) ==
+    (* Updates the server's follower end offset map with the
+       current set of members, setting all values to 0. *)
+    flwr_end_offset' = [flwr_end_offset EXCEPT ![s] = 
+                            [s1 \in members |-> 0]]
 
 IsConfigCommand(server_log, offset) ==
     (* The offset points to a reconfiguration command in the log. *)
     server_log[offset].command \in {InitClusterCommand,
-                                    AddServerCommand, 
-                                    RemoveServerCommand}
+                                    AddVoterCommand, 
+                                    RemoveVoterCommand}
 
 HasPendingConfigCommand(i) ==
     (* 
@@ -340,39 +411,38 @@ MaybeSwitchConfigurations(s, curr_config, new_state) ==
         to a new configuration or reverting to the prior 
         configuration (in the case of a log truncation).  
     *)
-    /\ leader' = [leader EXCEPT ![s] = new_state.leader]
+    /\ MaybeApplyChange(s, leader, new_state.leader)
+    /\ MaybeApplyChange(s, current_epoch, new_state.epoch)
     /\ config' = [config EXCEPT ![s] = curr_config]
          \* CASE 1) The server (a voter )has been removed from
          \*         membership and become an observer.
     /\ CASE role[s] = Voter /\ s \notin curr_config.members ->
                /\ role'  = [role EXCEPT ![s] = Observer]
                /\ state' = [state EXCEPT ![s] = Follower]
+               /\ MaybeApplyChange(s, votes_recv, {})
          \* CASE 2) The server (an observer) has been added 
          \*         to membership as a voter.
          [] role[s] = Observer /\ s \in curr_config.members ->
                /\ role'  = [role EXCEPT ![s] = Voter]
                /\ state' = [state EXCEPT ![s] = Follower]
-         \* CASE 3) The server role us unchanged.
+               /\ MaybeApplyChange(s, votes_recv, {})
+         \* CASE 3) The server role is unchanged.
          [] OTHER -> 
-               /\ state' = [state EXCEPT ![s] = new_state.state]
                /\ UNCHANGED role
-    \* ensure all members are in the flwr_end_offset map
-    \* this is just so the model checker doesn't barf later
-    /\ flwr_end_offset' = [flwr_end_offset EXCEPT ![s] =
-                               [s1 \in curr_config.members |-> 
-                                   IF s1 \in DOMAIN flwr_end_offset[s]
-                                   THEN flwr_end_offset[s][s1]
-                                   ELSE 0]]                                    
+               /\ MaybeApplyChange(s, state, new_state.state)
+               /\ MaybeApplyChange(s, votes_recv, new_state.votes_recv)
+    /\ UpdateFollowerEndOffsetMap(s, curr_config.members)
 
-LeaderHasCommittedOffsetsInCurrentEpoch(i) ==
+LeaderHasCommittedOffsetsInCurrentEpoch(s) ==
     (* 
         The server has log entries in its log of the
         current epoch, which are below the HWM (meaning
         they are committed). Must be TRUE for a leader to
         accept a reconfiguration command.
     *)
-    \E offset \in DOMAIN log[i] :
-        /\ log[i][offset].epoch = current_epoch[i]
-        /\ hwm[i] >= offset
+    \E offset \in DOMAIN log[s] :
+        /\ log[s][offset].epoch = current_epoch[s]
+        /\ hwm[s] >= offset
+
         
 ================================================

@@ -29,28 +29,61 @@ NetworkInit(servers) ==
     /\ net_connectivity_ctr = 0
 
 ----
+
+Drop(msgs) ==
+    /\ net_messages' = net_messages \ msgs
+    /\ net_messages_discard' = net_messages_discard \union msgs
+
 \* Network state transitions
 
 \* Any dead servers are included in network disconnection
 \* to avoid the combination of server death and networking
-\* issues from causing a cluster to become unavailable.
+\* issues from causing a cluster to be unable to form
+\* a majority of connected servers (which is a fundamental
+\* requisite for KRaft).
+
+PairMatch(servers, pair) ==
+    \E s \in servers : s \in pair
+    
+WholeCohortInPairs(servers, pairs) ==
+    \A s \in servers :
+        \E p \in pairs : s \in p
+        
+IncludesAllDead(dead_servers, disconnected_pairs) ==
+    /\ WholeCohortInPairs(dead_servers, disconnected_pairs)
+    /\ ~\E pair \in DOMAIN net_connectivity :
+        /\ PairMatch(dead_servers, pair)
+        /\ pair \notin disconnected_pairs    
+
+DisconnectedCount(net_conn) ==
+    Quantify(DOMAIN net_conn, 
+             LAMBDA pair : net_conn[pair] = FALSE)
+
 ChangeConnectivity(dead_servers) ==
     /\ net_connectivity_ctr < MaxConnectivityChanges
-    /\ \E disconnected \in SUBSET DOMAIN net_connectivity :
-       /\ \A dead \in dead_servers :
-            \E pair \in disconnected : dead \in pair
-       \* cannot have more disconnected pairs than the max
-       /\ Cardinality(disconnected) <= MaxDisconnectedPairs
-       \* make sure the new disconnected set is different to the current
-       /\ disconnected /= { pair \in DOMAIN net_connectivity : 
-                                net_connectivity[pair] = FALSE } 
-       /\ net_connectivity' = [pair \in DOMAIN net_connectivity |->
-                                    IF pair \in disconnected
+    /\ \E disconnected_pairs \in SUBSET DOMAIN net_connectivity :
+        \* the new disconnected set must include dead servers
+        /\ IncludesAllDead(dead_servers, disconnected_pairs)
+        \* if we're already over the disconnected limit, then reduce
+        \* the number of disconnected pairs, else simply stay at or below the limit
+        /\ IF DisconnectedCount(net_connectivity) > MaxDisconnectedPairs
+           THEN Cardinality(disconnected_pairs) < DisconnectedCount(net_connectivity)
+           ELSE Cardinality(disconnected_pairs) <= MaxDisconnectedPairs
+        \* make sure the new disconnected set is different to the current
+        /\ IF Cardinality(disconnected_pairs) = DisconnectedCount(net_connectivity)
+           THEN \E pair \in disconnected_pairs :
+                    net_connectivity[pair] = TRUE
+           ELSE TRUE
+        /\ net_connectivity' = [pair \in DOMAIN net_connectivity |->
+                                    IF pair \in disconnected_pairs
                                     THEN FALSE
                                     ELSE TRUE]
+        /\ Drop({m \in net_messages : 
+                    \E pair \in disconnected_pairs :
+                        /\ m.source \in pair
+                        /\ m.dest \in pair})
     /\ net_connectivity_ctr' = net_connectivity_ctr + 1
-    /\ UNCHANGED << net_messages, net_messages_discard >>
-       
+    
 \* ======================================================================
 \* ----- Message passing ------------------------------------------------
 
@@ -62,9 +95,28 @@ Connected(s1, s2) ==
         /\ net_connectivity[pair] = TRUE
     
 ConnectedServers(target, servers) ==
-    Quantify(servers, LAMBDA s : \E pair \in DOMAIN net_connectivity :
-                        /\ target \in pair
-                        /\ s \in pair) + 1
+    1 + Quantify(servers, LAMBDA s : 
+                        /\ s # target
+                        /\ \E pair \in DOMAIN net_connectivity :
+                            /\ target \in pair
+                            /\ s \in pair
+                            /\ net_connectivity[pair] = TRUE)
+
+ConnectedMajority(target, servers) ==
+    ConnectedServers(target, servers) > Cardinality(servers) \div 2
+
+DisconnectDeadServer(dead_server) ==
+    LET new_conn == [pair \in DOMAIN net_connectivity |->
+                                IF dead_server \in pair
+                                THEN FALSE
+                                ELSE net_connectivity[pair]]
+    IN /\ DisconnectedCount(new_conn) <= MaxDisconnectedPairs
+       /\ net_connectivity' = new_conn 
+       /\ Drop({m \in net_messages : 
+                    \/ m.source = dead_server
+                    \/ m.dest = dead_server})
+       /\ UNCHANGED << net_connectivity_ctr >>
+
 
 \* Send the message whether it already exists or not.
 \* If it does exist, the delivery count will go above 1 and
@@ -81,8 +133,9 @@ DiscardFunc(m, msgs) ==
 
 \* Send a message, without restriction
 Send(m) ==
-    /\ Connected(m.dest, m.source)
-    /\ net_messages' = SendFunc(m, net_messages, 1)
+    /\ net_messages' = IF Connected(m.dest, m.source)
+                       THEN SendFunc(m, net_messages, 1)
+                       ELSE SendFunc(m, net_messages, 0)
     /\ UNCHANGED << net_messages_discard, net_connectivity, net_connectivity_ctr >>
 
 RECURSIVE SendAllFunc(_,_)
@@ -90,17 +143,19 @@ SendAllFunc(send_msgs, msgs) ==
     IF send_msgs = {}
     THEN msgs
     ELSE LET m == CHOOSE m \in send_msgs : TRUE
-             new_msgs == SendFunc(m, msgs, 1)
+             new_msgs == IF Connected(m.dest, m.source)
+                         THEN SendFunc(m, msgs, 1)
+                         ELSE SendFunc(m, msgs, 0)
              remaining == send_msgs \ {m}
          IN SendAllFunc(remaining, new_msgs)
 
 SendAll(msgs) ==
-    /\ \A m \in msgs : Connected(m.dest, m.source)
     /\ net_messages' = SendAllFunc(msgs, net_messages)
     /\ UNCHANGED << net_messages_discard, net_connectivity, net_connectivity_ctr >>
 
+\* Guarantees the message is sent once. Used to disable an action without
+\* an explicit variable.
 SendAllOnce(msgs) ==
-    /\ \A m \in msgs : Connected(m.dest, m.source)
     /\ ~\E m \in msgs :
         \/ m \in net_messages
         \/ m \in net_messages_discard
@@ -108,7 +163,6 @@ SendAllOnce(msgs) ==
     /\ UNCHANGED << net_messages_discard, net_connectivity, net_connectivity_ctr >>    
 
 DiscardAndSendAll(d, msgs) ==
-    /\ \A m \in msgs : Connected(m.dest, m.source)
     /\ net_messages' = SendAllFunc(msgs, DiscardFunc(d, net_messages))
     /\ net_messages_discard' = net_messages_discard \union {d}
     /\ UNCHANGED << net_connectivity, net_connectivity_ctr >>
@@ -119,11 +173,6 @@ Discard(d) ==
     /\ net_messages_discard' = net_messages_discard \union {d}
     /\ UNCHANGED << net_connectivity, net_connectivity_ctr >>
     
-Drop(msgs) ==
-    /\ net_messages' = net_messages \ msgs
-    /\ net_messages_discard' = net_messages_discard \union msgs
-    /\ UNCHANGED << net_connectivity, net_connectivity_ctr >>    
-
 \* Discard incoming message and reply with another    
 Reply(d, m) ==
     /\ Connected(m.dest, m.source)
@@ -131,9 +180,20 @@ Reply(d, m) ==
     /\ net_messages' = SendFunc(m, DiscardFunc(d, net_messages), 1)
     /\ net_messages_discard' = net_messages_discard \union {d}
     /\ UNCHANGED << net_connectivity, net_connectivity_ctr >>
-    
+
 PreviouslySent(m) ==
     \/ m \in net_messages
     \/ m \in net_messages_discard    
+
+HasInflightVoteReq(s, type) ==
+    \E m \in net_messages :
+        /\ m.type = type
+        /\ m.source = s
+
+HasInflightVoteRes(s, type) ==
+    \E m \in net_messages :
+        /\ m.type = type
+        /\ m.dest = s
+    
 
 =============================================================================    
