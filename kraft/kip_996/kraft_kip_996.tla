@@ -38,22 +38,25 @@ RestartWithState(s) ==
     /\ s \in StartedServers
     /\ state[s] # DeadNoState
     \* state mutations
-    /\ state' = [state EXCEPT ![s] = 
-                    CASE /\ state[s] = Leader 
-                         /\ role[s] = Voter -> Resigned
-                      [] /\ state[s] = Leader 
-                         /\ role[s] = Observer -> Unattached
-                      [] OTHER -> @]
-    /\ leader' = [leader EXCEPT ![s] = IF state[s] = Leader
-                                       THEN Nil ELSE @]                                         
-    /\ votes_recv' = [votes_recv EXCEPT ![s] = {}]
-    /\ hwm' = [hwm EXCEPT ![s] = 0]
-    /\ pending_fetch' = [pending_fetch EXCEPT ![s] = Nil]
-    /\ ResetFollowerEndOffsetMap(s, DOMAIN flwr_end_offset[s])
-    /\ FailPendingWrites(s)
-    /\ aux_ctrs' = [aux_ctrs EXCEPT !.restart_ctr = @ + 1]
-    /\ UNCHANGED <<server_ids, NetworkVars, config, current_epoch, role, 
-                   voted_for, log, aux_disk_id_gen>>
+    /\ LET new_state_ldr == CASE /\ state[s] = Leader 
+                                 /\ role[s] = Voter -> 
+                                    [state |-> Resigned, leader |-> Nil]
+                              [] /\ state[s] = Leader 
+                                 /\ role[s] = Observer -> 
+                                    [state |-> Unattached, leader |-> Nil]
+                              [] OTHER ->
+                                    [state |-> state[s], leader |-> leader[s]]
+      IN
+         /\ state' = [state EXCEPT ![s] = new_state_ldr.state]
+         /\ leader' = [leader EXCEPT ![s] = new_state_ldr.leader]                                           
+         /\ votes_recv' = [votes_recv EXCEPT ![s] = {}]
+         /\ hwm' = [hwm EXCEPT ![s] = 0]
+         /\ pending_fetch' = [pending_fetch EXCEPT ![s] = Nil]
+         /\ ResetFollowerEndOffsetMap(s, DOMAIN flwr_end_offset[s])
+         /\ FailPendingWrites(s)
+         /\ aux_ctrs' = [aux_ctrs EXCEPT !.restart_ctr = @ + 1]
+         /\ UNCHANGED <<server_ids, NetworkVars, config, current_epoch, role, 
+                     voted_for, log, aux_disk_id_gen>>
 
 (* 
     ACTION: CrashLoseState -------------------------------------
@@ -67,37 +70,13 @@ RestartWithState(s) ==
     is not actually helpful, so we avoid it.
 *)
 
-ClusterStuck(crash_server) ==
-    (* 
-       Detects whether losing this server will result in a cluster
-       unable to make further progress due to only a minority being
-       functional.
-       
-       Tries to find a server such that when the crash server is
-       taken offline, the still forms a majority set of servers
-       where in an election it the server could win. If none exists,
-       then don't crash this server.
-    *)
-    IF TestLiveness = TRUE
-    THEN ~\E s \in StartedServers :
-            /\ role[s] = Voter
-            /\ s # crash_server
-            /\ Quantify(config[s].members, LAMBDA peer :
-                /\ peer # crash_server           \* not exclude_server
-                /\ role[peer] = Voter            \* is a functioning voter
-                /\ s \in config[peer].members    \* agrees that s is a member
-                /\ Len(log[s]) >= Len(log[peer]) \* could win election
-                /\ Connected(s, peer))           \* the two are connected
-                    > Cardinality(config[s].members) \div 2
-    ELSE TRUE
-
 CrashLoseState(s) ==
     \* enabling conditions
     /\ aux_ctrs.crash_ctr < MaxCrashes
     /\ s \in StartedServers
     /\ role[s] = Voter
-    /\ ~ClusterStuck(s)
     \* state mutations
+    /\ DisconnectDeadServer(s)
     /\ state' = [state EXCEPT ![s] = DeadNoState]
     /\ config' = [config EXCEPT ![s] = NoConfig]
     /\ role' = [role EXCEPT ![s] = Nil]    
@@ -110,7 +89,6 @@ CrashLoseState(s) ==
     /\ log' = [log EXCEPT ![s] = <<>>]
     /\ hwm' = [hwm EXCEPT ![s] = 0]
     /\ FailPendingWrites(s)
-    /\ DisconnectDeadServer(s)
     /\ aux_ctrs' = [aux_ctrs EXCEPT !.crash_ctr = @ + 1]
     /\ UNCHANGED <<aux_disk_id_gen, server_ids, aux_disk_id_gen>>
 
@@ -131,14 +109,7 @@ CheckQuorumResign(s) ==
                                         /\ Connected(s, peer)
                                         /\ \/ /\ role[peer] = Voter
                                               /\ current_epoch[s] >= current_epoch[peer]
-\*                                              /\ current_epoch[s] = current_epoch[peer]
-\*                                              /\ \/ leader[peer] = s
-\*                                                 \/ voted_for[peer] = s
                                            \/ role[peer] = Observer)
-\*                                              /\ \E m \in net_messages :
-\*                                                    /\ m.type = BeginQuorumRequest
-\*                                                    /\ m.dest = peer
-\*                                                    /\ m.epoch = current_epoch[s])
            min_connected == Cardinality(config[s].members) \div 2
            new_state     == IF role[s] = Voter
                             THEN TransitionToResigned(s)
@@ -228,11 +199,6 @@ ObserverFetchTimeout(s) ==
     /\ role[s] = Observer
     /\ pending_fetch[s] # Nil
     /\ ValidObserverTimeout(s)
-\*    /\ \/ /\ state[s] = Follower
-\*          /\ leader[s] # Nil
-\*          /\ ValidObserverTimeout(s)
-\*       \/ /\ state[s] = Unattached
-\*          /\ pending_fetch[s] # Nil
     /\ ApplyState(s, TransitionToUnattached(s, current_epoch[s], role[s]))
     /\ pending_fetch' = [pending_fetch EXCEPT ![s] = Nil]
     /\ UNCHANGED <<server_ids, config, role, pending_ack, flwr_end_offset, 
@@ -562,7 +528,6 @@ AcceptBeginQuorumRequest(s) ==
                            ELSE Nil
                new_state == MaybeTransition(s, peer, m.epoch)
            IN /\ error = Nil
-              /\ role[s] = Voter \* new check because roles can change with reconfigurations
               \* state mutations
               /\ ApplyState(s, new_state)
               /\ pending_fetch' = [pending_fetch EXCEPT ![s] = Nil]

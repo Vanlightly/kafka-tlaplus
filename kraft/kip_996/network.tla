@@ -55,9 +55,9 @@ IncludesAllDead(dead_servers, disconnected_pairs) ==
         /\ PairMatch(dead_servers, pair)
         /\ pair \notin disconnected_pairs    
 
-DisconnectedCount ==
-    Quantify(DOMAIN net_connectivity, 
-             LAMBDA pair : net_connectivity[pair] = FALSE)
+DisconnectedCount(net_conn) ==
+    Quantify(DOMAIN net_conn, 
+             LAMBDA pair : net_conn[pair] = FALSE)
 
 ChangeConnectivity(dead_servers) ==
     /\ net_connectivity_ctr < MaxConnectivityChanges
@@ -66,11 +66,11 @@ ChangeConnectivity(dead_servers) ==
         /\ IncludesAllDead(dead_servers, disconnected_pairs)
         \* if we're already over the disconnected limit, then reduce
         \* the number of disconnected pairs, else simply stay at or below the limit
-        /\ IF DisconnectedCount > MaxDisconnectedPairs
-           THEN Cardinality(disconnected_pairs) < DisconnectedCount
+        /\ IF DisconnectedCount(net_connectivity) > MaxDisconnectedPairs
+           THEN Cardinality(disconnected_pairs) < DisconnectedCount(net_connectivity)
            ELSE Cardinality(disconnected_pairs) <= MaxDisconnectedPairs
         \* make sure the new disconnected set is different to the current
-        /\ IF Cardinality(disconnected_pairs) = DisconnectedCount
+        /\ IF Cardinality(disconnected_pairs) = DisconnectedCount(net_connectivity)
            THEN \E pair \in disconnected_pairs :
                     net_connectivity[pair] = TRUE
            ELSE TRUE
@@ -106,14 +106,16 @@ ConnectedMajority(target, servers) ==
     ConnectedServers(target, servers) > Cardinality(servers) \div 2
 
 DisconnectDeadServer(dead_server) ==
-    /\ net_connectivity' = [pair \in DOMAIN net_connectivity |->
+    LET new_conn == [pair \in DOMAIN net_connectivity |->
                                 IF dead_server \in pair
                                 THEN FALSE
                                 ELSE net_connectivity[pair]]
-    /\ Drop({m \in net_messages : 
+    IN /\ DisconnectedCount(new_conn) <= MaxDisconnectedPairs
+       /\ net_connectivity' = new_conn 
+       /\ Drop({m \in net_messages : 
                     \/ m.source = dead_server
                     \/ m.dest = dead_server})
-    /\ UNCHANGED << net_connectivity_ctr >>
+       /\ UNCHANGED << net_connectivity_ctr >>
 
 
 \* Send the message whether it already exists or not.
