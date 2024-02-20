@@ -140,6 +140,21 @@ CheckQuorumResign(s) ==
     When only checking safety, an election timeout can happen at
     any time.
 *)
+
+CanWin(s) ==
+    \* A majority of servers would grant a pre-vote. This is
+    \* is important when checking liveness to avoid an infinite
+    \* cycle of a prospective sending pre-vote requests, but
+    \* unable to win.
+    Quantify(config[s].members, LAMBDA s1 :
+                /\ Connected(s, s1)
+                /\ state[s1] = Prospective
+                /\ CompareEntries(Len(log[s]),
+                                  LastEpoch(log[s]),
+                                  Len(log[s1]),
+                                  LastEpoch(log[s1])) >= 0)
+        > Cardinality(config[s].members) \div 2
+
 NotEnoughVotes(s, pre_vote) ==
     /\ ~HasInflightVoteReq(s, RequestVoteRequest, pre_vote)
     /\ ~HasInflightVoteRes(s, RequestVoteResponse, pre_vote)
@@ -148,7 +163,8 @@ NotEnoughVotes(s, pre_vote) ==
     
 ValidTimeout(s) ==
     IF TestLiveness
-    THEN /\ \* 1) The server is a follower which it either cut-off from
+    THEN /\ \* One of the following conditions are met:
+            \* 1) The server is a follower which it either cut-off from
             \* the leader or the leader has perished.
             \/ /\ state[s] = Follower
                /\ \/ ~Connected(s, leader[s])
@@ -162,9 +178,11 @@ ValidTimeout(s) ==
             \/ /\ state[s] = Voted
                /\ NotEnoughVotes(voted_for[s], FALSE)
             \* 4) The server is a prospective, hasn't reached a majority and no more
-            \*    replies are coming in.
+            \*    replies are coming in. Also, to prevent infinite attempts that it
+            \*    cannot win, only do the timeout if it can indeed win a pre-vote.
             \/ /\ state[s] = Prospective
                /\ NotEnoughVotes(s, TRUE)
+               /\ CanWin(s) \* prevent infinite cycle of attempts 
             \* 5) The server is unattached or resigned.
             \/ state[s] \in {Unattached, Resigned}
     ELSE state[s] \in {Follower, Candidate, Unattached, 
@@ -487,6 +505,44 @@ BecomeLeader(s) ==
                     dest    |-> peer] : peer \in config[s].members \ {s}})
           /\ UNCHANGED <<server_ids, config, role, pending_fetch, pending_ack, 
                          hwm, invVars, auxVars>>
+                         
+(*
+    ACTION: MaybeUnblockProspective -------------------------------------------
+    Server (s) is a voter in the Leader state. It has not received
+    a fetch request from a follower for time period and therefore
+    sends a BeginQuorumEpochRequest as a nudge to the follower in
+    case it has become stuck as a Prospective.
+    
+    It is possible for a Prospective to be unable to win a pre-vote
+    as it has a smaller log than its peers. In this case, either
+    the leader (if it still is leader) must nudge it with a 
+    BeginQuorumEpoch request or another follower must win a pre-vote.
+*)
+
+NeedsNudge(s, f) ==
+    \* When checking liveness only send the request when the 
+    \* follower actually might need it. When checking safety 
+    \* only, let the leader send this request at any time.
+    /\ ~IsInflight(s, f, BeginQuorumRequest)
+    /\ IF TestLiveness = TRUE
+       THEN /\ Connected(s, f)
+            /\ state[f] = Prospective
+       ELSE TRUE
+
+MaybeUnblockProspective(s) ==
+    \* enabling conditions
+    /\ s \in StartedServers
+    /\ state[s] = Leader
+    \* state mutations
+    /\ \E f \in config[s].members :
+        /\ f # s
+        /\ NeedsNudge(s, f)
+        /\ Send([type    |-> BeginQuorumRequest,
+                 epoch   |-> current_epoch[s],
+                 source  |-> s,
+                 dest    |-> f])
+        /\ UNCHANGED <<logVars, serverVars, leaderVars, candidateVars,
+                       invVars, auxVars, server_ids>>                         
 
 (* 
     ACTION: AcceptBeginQuorumRequest -------------------------------------------
@@ -1216,6 +1272,7 @@ Next ==
         \* leader actions -------------------------
         \/ ClientRequest(s)
         \/ CheckQuorumResign(s)
+        \/ MaybeUnblockProspective(s)
     \/ \E s, peer \in AllServers :        
         \/ RejectFetchRequest(s, peer)
         \/ DivergingFetchRequest(s, peer)
@@ -1235,6 +1292,7 @@ Next ==
 *)    
 Fairness ==
     \A s \in AllServers :
+        /\ WF_vars(MaybeUnblockProspective(s))
         /\ WF_vars(CheckQuorumResign(s))
         /\ WF_vars(VoterElectionTimeout(s))
         /\ WF_vars(ObserverFetchTimeout(s))

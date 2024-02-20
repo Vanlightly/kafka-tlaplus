@@ -333,13 +333,14 @@ MaybeHandleCommonResponse(s, leader_id, epoch, errors) ==
       [] /\ epoch = current_epoch[s]
          /\ leader_id # Nil
          /\ leader[s] = Nil
-         /\ leader_id # s -> \* KIP-966, see comment below
+         /\ state[s] # Prospective -> 
+                \* KIP-996, see comment below
                 \* 4th criteria added as a resigned leader could now be 
                 \* a prospective in same epoch and get a response
                 \* from a peer saying that it is the leader in this epoch
                 TransitionToFollower(s, leader_id, epoch) @@
-                     [handled |-> TRUE, 
-                      error   |-> errors]
+                         [handled |-> TRUE, 
+                          error   |-> errors]
       \* CASE 4) no changes to state or leadership --------
       [] OTHER -> 
                 [state        |-> state[s],

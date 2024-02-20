@@ -155,7 +155,8 @@ ReconfigurationNotStuck ==
 \* due to being unable to elect a leader.
     
 FunctionalLeaderExists ==
-    \E s \in StartedServers : 
+    \E s \in AllServers : 
+        /\ s \in DOMAIN state
         /\ state[s] = Leader
         /\ Quantify(StartedServers, LAMBDA s1 : /\ role[s1] = Voter
                                                 /\ leader[s1] = s
@@ -165,5 +166,21 @@ FunctionalLeaderExists ==
         
 EventuallyLeaderElected ==
       ~FunctionalLeaderExists ~> FunctionalLeaderExists      
+
+\* LIVENESS: NotStuckInProspective
+\* A server will not remain in prospective forever unless
+\* it becomes permanently disconnected from the functioning
+\* leader.
+
+IsProspective(s) ==
+    /\ s \in DOMAIN state
+    /\ state[s] = Prospective
+
+NotStuckInProspective ==
+    \A s \in AllServers :
+        IsProspective(s) ~> (\/ ~IsProspective(s)
+                             \/ \E s1 \in AllServers :
+                                 /\ IsCurrentLeader(s1)
+                                 /\ ~Connected(s, s1))
         
 ================================================
