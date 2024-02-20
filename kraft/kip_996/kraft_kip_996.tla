@@ -38,25 +38,25 @@ RestartWithState(s) ==
     /\ s \in StartedServers
     /\ state[s] # DeadNoState
     \* state mutations
-    /\ LET new_state_ldr == CASE /\ state[s] = Leader 
-                                 /\ role[s] = Voter -> 
-                                    [state |-> Resigned, leader |-> Nil]
-                              [] /\ state[s] = Leader 
-                                 /\ role[s] = Observer -> 
-                                    [state |-> Unattached, leader |-> Nil]
-                              [] OTHER ->
-                                    [state |-> state[s], leader |-> leader[s]]
+    /\ LET new_state == CASE /\ state[s] = Leader 
+                             /\ role[s] = Voter -> 
+                                    TransitionToResigned(s)
+                          [] /\ state[s] = Leader 
+                             /\ role[s] = Observer -> 
+                                    TransitionToUnattached(s,
+                                        current_epoch[s],
+                                        role[s])
+                          [] OTHER ->
+                                    NoTransition(s)
       IN
-         /\ state' = [state EXCEPT ![s] = new_state_ldr.state]
-         /\ leader' = [leader EXCEPT ![s] = new_state_ldr.leader]                                           
-         /\ votes_recv' = [votes_recv EXCEPT ![s] = {}]
+         /\ ApplyState(s, new_state)
          /\ hwm' = [hwm EXCEPT ![s] = 0]
          /\ pending_fetch' = [pending_fetch EXCEPT ![s] = Nil]
          /\ ResetFollowerEndOffsetMap(s, DOMAIN flwr_end_offset[s])
          /\ FailPendingWrites(s)
          /\ aux_ctrs' = [aux_ctrs EXCEPT !.restart_ctr = @ + 1]
-         /\ UNCHANGED <<server_ids, NetworkVars, config, current_epoch, role, 
-                     voted_for, log, aux_disk_id_gen>>
+         /\ UNCHANGED <<server_ids, NetworkVars, config, role, 
+                        log, aux_disk_id_gen>>
 
 (* 
     ACTION: CrashLoseState -------------------------------------
@@ -127,6 +127,10 @@ CheckQuorumResign(s) ==
     Server (s) is a voter and not the leader, and experiences
     an fetch time out or directly an election timeout. This action
     is used for both cases.
+    
+    The server sends a pre-vote RequestVote request to all peers in
+    its configuration but not itself. It adds itself to its received
+    votes set.
 
     When checking liveness, the election timeout can only happen
     for a reason, such as being a follower that is disconnected
@@ -163,17 +167,28 @@ ValidTimeout(s) ==
                /\ NotEnoughVotes(s, TRUE)
             \* 5) The server is unattached or resigned.
             \/ state[s] \in {Unattached, Resigned}
-    ELSE state[s] \in {Follower, Candidate, Unattached, Voted, Prospective}
+    ELSE state[s] \in {Follower, Candidate, Unattached, 
+                       Voted, Prospective, Resigned}
 
 VoterElectionTimeout(s) ==
+    \* enabling conditions
     /\ s \in StartedServers
     /\ role[s] = Voter
     /\ s \in config[s].members
     /\ ValidTimeout(s)
+    \* state mutations
     /\ ApplyState(s, TransitionToProspective(s))
+    /\ pending_fetch' = [pending_fetch EXCEPT ![s] = Nil]
+    /\ SendAll(
+            {[type            |-> RequestVoteRequest,
+              epoch           |-> current_epoch[s],
+              last_log_epoch  |-> LastEpoch(log[s]),
+              last_log_offset |-> Len(log[s]),
+              pre_vote        |-> TRUE,
+              source          |-> s,
+              dest            |-> s1] : s1 \in config[s].members \ {s}})
     /\ UNCHANGED <<server_ids, config, role, pending_ack, 
-                   flwr_end_offset, pending_fetch,
-                   logVars, invVars, auxVars, NetworkVars>>
+                   flwr_end_offset, logVars, invVars, auxVars>>
                    
 
 (*
@@ -195,49 +210,16 @@ ValidObserverTimeout(s) ==
     ELSE TRUE
 
 ObserverFetchTimeout(s) ==
+    \* enabling conditions
     /\ s \in StartedServers
     /\ role[s] = Observer
     /\ pending_fetch[s] # Nil
     /\ ValidObserverTimeout(s)
+    \* state mutations
     /\ ApplyState(s, TransitionToUnattached(s, current_epoch[s], role[s]))
     /\ pending_fetch' = [pending_fetch EXCEPT ![s] = Nil]
     /\ UNCHANGED <<server_ids, config, role, pending_ack, flwr_end_offset, 
                    logVars, invVars, auxVars, NetworkVars>>                   
-
-(*
-    ACTION: RequestPreVote -----------------------------------------------
-    Server (s) is a voter and not the leader, and experiences
-    an election time out. It sends a pre-vote RequestVote request to 
-    all peers in its configuration but not itself.
-    
-    This action combines an election timeout with a pre-vote RequestVote
-    broadcast. This means we allow the server to request a pre-vote
-    in the Voted state which is not strictly legal. However,
-    this specification compresses the election timeout (which
-    transitions a Voted server into a Candidate) and the new election
-    into this single action).
-*)
-RequestPreVote(s) ==
-    \* enabling conditions
-    /\ s \in StartedServers
-    /\ role[s] = Voter
-    /\ state[s] = Prospective
-    /\ s \in config[s].members
-    /\ votes_recv[s] = {} \* not yet sent a pre-vote
-    \* state mutations
-    /\ votes_recv' = [votes_recv EXCEPT ![s] = {s}] \* votes for itself
-    /\ pending_fetch' = [pending_fetch EXCEPT ![s] = Nil]
-    /\ SendAll(
-            {[type            |-> RequestVoteRequest,
-              epoch           |-> current_epoch[s],
-              last_log_epoch  |-> LastEpoch(log[s]),
-              last_log_offset |-> Len(log[s]),
-              pre_vote        |-> TRUE,
-              source          |-> s,
-              dest            |-> s1] : s1 \in config[s].members \ {s}})
-    /\ UNCHANGED <<server_ids, state, leader, current_epoch, config, 
-                   role, voted_for, pending_ack, leaderVars, logVars,
-                   invVars, auxVars>>
 
 (* 
     ACTION: HandleRequestPreVoteRequest ------------------------------
@@ -1220,7 +1202,6 @@ Next ==
         \/ AcceptRemoveVoterRequest(s)
         \* elections ------------------------------
         \/ VoterElectionTimeout(s)
-        \/ RequestPreVote(s)
         \/ HandlePreVoteRequest(s)
         \/ HandlePreVoteResponse(s)
         \/ RequestVote(s)
@@ -1257,7 +1238,6 @@ Fairness ==
         /\ WF_vars(CheckQuorumResign(s))
         /\ WF_vars(VoterElectionTimeout(s))
         /\ WF_vars(ObserverFetchTimeout(s))
-        /\ WF_vars(RequestPreVote(s))
         /\ WF_vars(HandlePreVoteRequest(s))
         /\ WF_vars(HandlePreVoteResponse(s))
         /\ WF_vars(RequestVote(s))

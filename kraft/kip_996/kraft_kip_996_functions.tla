@@ -257,17 +257,17 @@ TransitionToResigned(s) ==
     THEN SetIllegalState
     ELSE [state        |-> Resigned, 
           epoch        |-> current_epoch[s],
-          leader       |-> Nil,
+          leader       |-> s, \* maintains its local leader value
           votes_recv   |-> {},
           voted_for    |-> voted_for[s]]  \* don't forget prior vote
      
 TransitionToProspective(s) ==
     (* Transitioning to Prospective and sending pre-votes occur
-       in separate actions, so votes_recv remains empty*)
+       in the same action, so (s) added to votes_recv *)
     [state        |-> Prospective, 
      epoch        |-> current_epoch[s],
      leader       |-> Nil,
-     votes_recv   |-> {},
+     votes_recv   |-> {s}, \* votes for itself
      voted_for    |-> voted_for[s]] \* don't forget prior vote
 
 TransitionToCandidate(s) ==
