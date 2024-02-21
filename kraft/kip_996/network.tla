@@ -196,11 +196,6 @@ HasInflightVoteRes(s, type, pre_vote) ==
         /\ m.type = type
         /\ m.pre_vote = pre_vote
         /\ m.dest = s
-
-IsInflight(source, dest, type) ==
-    \E m \in net_messages :
-        /\ m.type = type
-        /\ m.source = source
-        /\ m.dest = dest
+    
 
 =============================================================================    
