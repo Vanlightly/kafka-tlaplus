@@ -1,30 +1,39 @@
 --------------------------- MODULE network ---------------------------
 EXTENDS FiniteSets, FiniteSetsExt, Sequences, SequencesExt, Integers, TLC
 
-CONSTANT MaxDisconnectedPairs,
-         MaxConnectivityChanges \* Limits the number of times connectivity between server
-                                \* pairs can change.
+\* The maximum possible disconnected pairs. If this is set too
+\* high it can break liveness. The maximum value of this constant
+\* should be related to the cluster size:
+\* Cluster of 3: 2
+\* Cluster of 5: 6
+\* When using reconfiguration, set it based on the minimum cluster size.
+CONSTANT MaxDisconnectedPairs
 
-VARIABLES net_messages,
-          net_messages_discard,
-          net_connectivity,
-          net_connectivity_ctr    \* the number of times connectivity changes
+\* Limits the number of times connectivity between server
+\* pairs can change.
+CONSTANT MaxConnectivityChanges 
+
+VARIABLES net_messages,           \* the messages sent but not received
+          net_messages_processed, \* the messages already processed
+          net_connectivity,       \* map of KEY: set of server pairs, VALUE: TRUE/FALSE for connectivity
+          net_connectivity_ctr    \* the number of times connectivity has changed
 
 NetworkView == << net_messages, net_connectivity>>
 NetworkVars == << net_messages,
-                  net_messages_discard,
+                  net_messages_processed,
                   net_connectivity,
                   net_connectivity_ctr >>
 
 Messages == net_messages
-ProcessedMessages == net_messages_discard
+ProcessedMessages == net_messages_processed
 
 ServerPairs(servers) == 
     { s \in SUBSET servers : Cardinality(s) = 2 }
 
+\* All servers start connected to each other.
 NetworkInit(servers) == 
     /\ net_messages = {}
-    /\ net_messages_discard = {}
+    /\ net_messages_processed = {}
     /\ net_connectivity = [pairs \in ServerPairs(servers) |-> TRUE]
     /\ net_connectivity_ctr = 0
 
@@ -32,7 +41,7 @@ NetworkInit(servers) ==
 
 Drop(msgs) ==
     /\ net_messages' = net_messages \ msgs
-    /\ net_messages_discard' = net_messages_discard \union msgs
+    /\ UNCHANGED net_messages_processed
 
 \* Network state transitions
 
@@ -83,7 +92,7 @@ ChangeConnectivity(dead_servers) ==
                         /\ m.source \in pair
                         /\ m.dest \in pair})
     /\ net_connectivity_ctr' = net_connectivity_ctr + 1
-    
+
 \* ======================================================================
 \* ----- Message passing ------------------------------------------------
 
@@ -136,7 +145,7 @@ Send(m) ==
     /\ net_messages' = IF Connected(m.dest, m.source)
                        THEN SendFunc(m, net_messages, 1)
                        ELSE SendFunc(m, net_messages, 0)
-    /\ UNCHANGED << net_messages_discard, net_connectivity, net_connectivity_ctr >>
+    /\ UNCHANGED << net_messages_processed, net_connectivity, net_connectivity_ctr >>
 
 RECURSIVE SendAllFunc(_,_)
 SendAllFunc(send_msgs, msgs) ==
@@ -151,26 +160,27 @@ SendAllFunc(send_msgs, msgs) ==
 
 SendAll(msgs) ==
     /\ net_messages' = SendAllFunc(msgs, net_messages)
-    /\ UNCHANGED << net_messages_discard, net_connectivity, net_connectivity_ctr >>
+    /\ UNCHANGED << net_messages_processed, net_connectivity, 
+                    net_connectivity_ctr >>
 
 \* Guarantees the message is sent once. Used to disable an action without
 \* an explicit variable.
 SendAllOnce(msgs) ==
     /\ ~\E m \in msgs :
         \/ m \in net_messages
-        \/ m \in net_messages_discard
+        \/ m \in net_messages_processed
     /\ net_messages' = SendAllFunc(msgs, net_messages)
-    /\ UNCHANGED << net_messages_discard, net_connectivity, net_connectivity_ctr >>    
+    /\ UNCHANGED << net_messages_processed, net_connectivity, net_connectivity_ctr >>    
 
 DiscardAndSendAll(d, msgs) ==
     /\ net_messages' = SendAllFunc(msgs, DiscardFunc(d, net_messages))
-    /\ net_messages_discard' = net_messages_discard \union {d}
+    /\ net_messages_processed' = net_messages_processed \union {d}
     /\ UNCHANGED << net_connectivity, net_connectivity_ctr >>
 
 \* Set the delivery count to 0 so the message cannot be processed again.
 Discard(d) ==
     /\ net_messages' = DiscardFunc(d, net_messages)
-    /\ net_messages_discard' = net_messages_discard \union {d}
+    /\ net_messages_processed' = net_messages_processed \union {d}
     /\ UNCHANGED << net_connectivity, net_connectivity_ctr >>
     
 \* Discard incoming message and reply with another    
@@ -178,12 +188,12 @@ Reply(d, m) ==
     /\ Connected(m.dest, m.source)
     /\ d \in net_messages
     /\ net_messages' = SendFunc(m, DiscardFunc(d, net_messages), 1)
-    /\ net_messages_discard' = net_messages_discard \union {d}
+    /\ net_messages_processed' = net_messages_processed \union {d}
     /\ UNCHANGED << net_connectivity, net_connectivity_ctr >>
 
 PreviouslySent(m) ==
     \/ m \in net_messages
-    \/ m \in net_messages_discard    
+    \/ m \in net_messages_processed    
 
 HasInflightVoteReq(s, type, pre_vote) ==
     \E m \in net_messages :
@@ -196,6 +206,21 @@ HasInflightVoteRes(s, type, pre_vote) ==
         /\ m.type = type
         /\ m.pre_vote = pre_vote
         /\ m.dest = s
-    
+
+InflightOrProcessed(source, dest, type) ==
+    \/ \E m \in net_messages :
+        /\ m.type = type
+        /\ m.source = source
+        /\ m.dest = dest
+    \/ \E m \in net_messages_processed :
+        /\ m.type = type
+        /\ m.source = source
+        /\ m.dest = dest
+
+RequestOrResLost(req, type) ==
+    /\ req \notin net_messages
+    /\ ~\E res \in net_messages :
+        /\ res.type = type
+        /\ res.correlation = req
 
 =============================================================================    

@@ -140,6 +140,38 @@ ValidFetchPosition(s, m) ==
           /\ m.fetch_offset <= end.offset + 1
           /\ m.last_fetched_epoch = end.epoch
 
+\* Fetch state helpers -------------------------------
+
+CanFetchTimeout(s) ==
+    \* either the last fetch response from the leader was a fail
+    \* (and so may be subsequent ones will fail too).
+    \/ /\ fetch_state[s].last_fetch_res # Nil
+       /\ fetch_state[s].last_fetch_res.error # Nil
+       /\ fetch_state[s].last_fetch_res.peer = leader[s]
+    \* or we're pending a fetch reponse that will never come
+    \/ /\ fetch_state[s].pending_fetch # Nil
+       /\ RequestOrResLost(fetch_state[s].pending_fetch, FetchResponse)
+
+BlankFetchState == [pending_fetch     |-> Nil,
+                    last_fetch_res    |-> Nil,
+                    has_fetch_success |-> FALSE]
+
+ResetFetchState(s) ==
+    fetch_state' = [fetch_state EXCEPT ![s] = BlankFetchState]
+
+UpdateFetchStateWithFetchReq(s, fetch_req) ==
+    fetch_state' = [fetch_state EXCEPT ![s].pending_fetch = fetch_req]
+
+UpdateFetchStateWithFetchRes(s, fetch_res) ==
+    fetch_state' = [fetch_state EXCEPT ![s] =
+                        [pending_fetch     |-> Nil,
+                         last_fetch_res    |-> [peer  |-> fetch_res.source,
+                                                error |-> fetch_res.error],
+                         has_fetch_success |-> IF /\ fetch_state[s].has_fetch_success = FALSE
+                                                  /\ fetch_res.error = Nil
+                                               THEN TRUE 
+                                               ELSE fetch_state[s].has_fetch_success]]
+
 \* Transition helpers ------------------------------
 
 HasConsistentLeader(s, leader_id, epoch) ==
@@ -333,7 +365,7 @@ MaybeHandleCommonResponse(s, leader_id, epoch, errors) ==
       [] /\ epoch = current_epoch[s]
          /\ leader_id # Nil
          /\ leader[s] = Nil
-         /\ leader_id # s -> \* KIP-966, see comment below
+         /\ leader_id # s -> \* KIP-996, see comment below
                 \* 4th criteria added as a resigned leader could now be 
                 \* a prospective in same epoch and get a response
                 \* from a peer saying that it is the leader in this epoch

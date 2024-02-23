@@ -164,6 +164,26 @@ FunctionalLeaderExists ==
    
         
 EventuallyLeaderElected ==
-      ~FunctionalLeaderExists ~> FunctionalLeaderExists      
+      ~FunctionalLeaderExists ~> FunctionalLeaderExists
+      
+\* LIVENESS: NotStuckInProspective
+\* A server will not remain in prospective forever, unless
+\* it is completely cut-off from all non-prospective servers.
+\* Prospectives will be unable to inform the server of the
+\* leader and so a server that is disconnected from the leader
+\* and all other non-prospectives will be stuck in Prospective
+\* state.
+
+IsProspective(s) ==
+    /\ s \in DOMAIN state
+    /\ state[s] = Prospective
+
+NotStuckInProspective ==
+    \A s \in AllServers :
+        IsProspective(s) ~> (\/ ~IsProspective(s)
+                             \/ ~\E s1 \in config[s].members :
+                                 /\ s # s1
+                                 /\ state[s1] # Prospective
+                                 /\ Connected(s, s1))
         
 ================================================

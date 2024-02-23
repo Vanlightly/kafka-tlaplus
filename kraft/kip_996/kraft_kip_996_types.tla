@@ -57,7 +57,7 @@ CONSTANTS UnknownMember, AlreadyMember, ReconfigInProgress, LeaderNotReady,
 \* Message types:
 CONSTANTS RequestVoteRequest,
           RequestVoteResponse,
-          BeginQuorumRequest,
+          BeginQuorumEpochRequest,
           FetchRequest,
           FetchResponse
 
@@ -108,7 +108,7 @@ VARIABLES config,         \* The current configuration
           state,          \* The server's state (Follower, Candidate, Observer etc)
           voted_for,      \* The candidate the server voted for in its current epoch.
           leader,         \* The peer that the server believes is the current leader
-          pending_fetch,  \* Tracks the currently pending fetch request of a follower
+          fetch_state,    \* Tracks the state of fetching as a followe
           pending_ack,    \* The log entries pending an ack to the client
           log,            \* A sequence of log entries that makes the Raft log.
           hwm,            \* The offset of the latest entry in the log the state machine may apply.
@@ -128,7 +128,8 @@ VARIABLES aux_ctrs,       \* A set of counters used for state-space control.
 
 \* variable groupings (useful for UNCHANGED)
 logVars == <<log, hwm>>
-serverVars == <<config, current_epoch, role, state, voted_for, leader, pending_fetch, pending_ack>>
+serverVars == <<config, current_epoch, role, state, voted_for, leader, 
+                fetch_state, pending_ack>>
 candidateVars == <<votes_recv>>
 leaderVars == <<flwr_end_offset>>
 invVars == <<inv_sent, inv_pos_acked, inv_neg_acked >>
