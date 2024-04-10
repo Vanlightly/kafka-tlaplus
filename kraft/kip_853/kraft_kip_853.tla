@@ -50,20 +50,20 @@ RestartWithState(s) ==
     /\ s \in StartedServers
     /\ state[s] # DeadNoState
     \* state mutations
-    /\ LET new_state_ldr == CASE /\ state[s] = Leader 
-                                 /\ role[s] = Voter -> 
-                                    [state |-> Resigned, leader |-> Nil]
-                              [] /\ state[s] = Leader 
-                                 /\ role[s] = Observer -> 
-                                    [state |-> Unattached, leader |-> Nil]
-                              [] OTHER ->
-                                    [state |-> state[s], leader |-> leader[s]]
+    /\ LET new_state == CASE /\ state[s] = Leader 
+                             /\ role[s] = Voter -> 
+                                    TransitionToResigned(s)
+                          [] /\ state[s] = Leader 
+                             /\ role[s] = Observer -> 
+                                    TransitionToUnattached(s,
+                                        current_epoch[s],
+                                        role[s])
+                          [] OTHER ->
+                                    NoTransition(s)
       IN
-         /\ state' = [state EXCEPT ![s] = new_state_ldr.state]
-         /\ leader' = [leader EXCEPT ![s] = new_state_ldr.leader]                                        
-         /\ votes_recv' = [votes_recv EXCEPT ![s] = {}]
+         /\ ApplyState(s, new_state)                                    
          /\ hwm' = [hwm EXCEPT ![s] = 0]
-         /\ pending_fetch' = [pending_fetch EXCEPT ![s] = Nil]
+         /\ ResetFetchState(s)
          /\ ResetFollowerEndOffsetMap(s, DOMAIN flwr_end_offset[s])
          /\ FailPendingWrites(s)
          /\ aux_ctrs' = [aux_ctrs EXCEPT !.restart_ctr = @ + 1]
@@ -95,8 +95,8 @@ CrashLoseState(s) ==
     /\ current_epoch' = [current_epoch EXCEPT ![s] = 0]
     /\ leader' = [leader EXCEPT ![s] = Nil]
     /\ voted_for' = [voted_for EXCEPT ![s] = Nil]
-    /\ pending_fetch' = [pending_fetch EXCEPT ![s] = Nil] 
     /\ votes_recv' = [votes_recv EXCEPT ![s] = {}]
+    /\ ResetFetchState(s)
     /\ ResetFollowerEndOffsetMap(s, {})
     /\ log' = [log EXCEPT ![s] = <<>>]
     /\ hwm' = [hwm EXCEPT ![s] = 0]
@@ -104,13 +104,44 @@ CrashLoseState(s) ==
     /\ aux_ctrs' = [aux_ctrs EXCEPT !.crash_ctr = @ + 1]
     /\ UNCHANGED <<aux_disk_id_gen, server_ids, aux_disk_id_gen>>
 
+(* 
+    ACTION: CheckQuorumResign -------------------------------------
+    Server (s) is a leader but resigns because it cannot receive 
+    fetch requests from enough followers to consitute a functional
+    majority. This happens either due to enough followers being
+    disconnected or no longer believing this server is the leader.
+
+    Note that min_connected is a minority as we do not count server
+    (s), when (s) it included, it would reach a majority. 
+*)
+CheckQuorumResign(s) ==
+    /\ s \in StartedServers
+    /\ state[s] = Leader
+    /\ LET connected_peers == Quantify(config[s].members, LAMBDA peer :
+                                        /\ s # peer
+                                        /\ Connected(s, peer)
+                                        /\ \/ /\ role[peer] = Voter
+                                              /\ current_epoch[s] >= current_epoch[peer]
+                                           \/ role[peer] = Observer)
+           min_connected == Cardinality(config[s].members) \div 2
+           new_state     == IF role[s] = Voter
+                            THEN TransitionToResigned(s)
+                            ELSE TransitionToUnattached(s, current_epoch[s], Observer)
+       IN /\ \/ /\ TestLiveness = TRUE
+                /\ connected_peers < min_connected
+             \/ TestLiveness = FALSE
+          /\ ApplyState(s, new_state)
+    /\ UNCHANGED <<NetworkVars, server_ids, role, config, current_epoch,
+                   fetch_state, pending_ack, invVars, leaderVars,
+                   logVars, auxVars>>
+
 (*
     ACTION: ObserverFetchTimeout -----------------------------------------------
     Server (s) is an observer, and experiences a fetch time out.
 
     When checking liveness, the fetch timeout can only happen
-    for a reason, such as being disconnected from the leader
-    or the leader failing/losing leadership.
+    for a reason, such as receiving failed fetch responses or
+    never receiving a response.
         
     When only checking safety, a fetch timeout can happen at
     any time.
@@ -118,17 +149,15 @@ CrashLoseState(s) ==
 
 ValidObserverTimeout(s) ==
     IF TestLiveness
-    THEN LET peer == pending_fetch[s].dest
-         IN ~Connected(s, peer)
+    THEN CanFetchTimeout(s)
     ELSE TRUE
 
 ObserverFetchTimeout(s) ==
     /\ s \in StartedServers
     /\ role[s] = Observer
-    /\ pending_fetch[s] # Nil
     /\ ValidObserverTimeout(s)
     /\ ApplyState(s, TransitionToUnattached(s, current_epoch[s], role[s]))
-    /\ pending_fetch' = [pending_fetch EXCEPT ![s] = Nil]
+    /\ ResetFetchState(s)
     /\ UNCHANGED <<server_ids, config, role, pending_ack, flwr_end_offset, 
                    logVars, invVars, auxVars, NetworkVars>> 
 
@@ -140,7 +169,7 @@ ObserverFetchTimeout(s) ==
 
     When checking liveness, the election timeout can only happen
     for a reason, such as being a follower that is disconnected
-    from the leader, a prospective/candidate that couldn't get
+    from the leader, a candidate that couldn't get
     enough votes, or being unattached. This is because an election
     may be required for a cluster to make progress and thus 
     limiting the number of elections can cause liveness properties
@@ -167,8 +196,7 @@ FetchOrElectionTimeout(s) ==
     THEN /\ \* 1) The server is a follower which it either cut-off from
             \* the leader or the leader has perished.
             \/ /\ state[s] = Follower
-               /\ \/ ~Connected(s, leader[s])
-                  \/ state[leader[s]] # Leader
+               /\ CanFetchTimeout(s)
             \* 2) The server is a candidate and has lost connectivity such that
             \*    it cannot form a majority.
             \/ /\ state[s] = Candidate
@@ -179,7 +207,8 @@ FetchOrElectionTimeout(s) ==
                /\ NotEnoughVotes(voted_for[s])
             \* 4) The server is unattached or resigned.
             \/ state[s] \in {Unattached, Resigned}
-    ELSE state[s] \in {Follower, Candidate, Unattached, Voted}
+    ELSE state[s] \in {Follower, Candidate, Unattached, 
+                       Voted, Resigned}
 
 WithinEpochLimit(s) ==
     IF TestLiveness
@@ -197,7 +226,7 @@ SendRequestVote(s) ==
     \* state mutations
     /\ LET new_state == TransitionToCandidate(s)
        IN /\ ApplyState(s, new_state)
-          /\ pending_fetch' = [pending_fetch EXCEPT ![s] = Nil]
+          /\ ResetFetchState(s)
           /\ SendAll(
                   {[type            |-> RequestVoteRequest,
                     epoch           |-> new_state.epoch,
@@ -210,7 +239,7 @@ SendRequestVote(s) ==
 
 (* 
     ACTION: HandleVoteRequest ------------------------------
-    Server (s0) receives a RequestVote message. 
+    Server (s) receives a RequestVote message. 
 
     While this server may be an Observer and therefore believe 
     it is not a member of a configuration, it may in fact be 
@@ -224,13 +253,13 @@ SendRequestVote(s) ==
     2) the last entry of (s) is <= to the last entry of (peer)
     3) (s) has not already voted for a different server
 *)
-HandleVoteRequest(s) ==
+HandleVoteRequest(s, peer) ==
     \* enabling conditions
     \E m \in Messages :
         /\ ReceivableMessage(m, RequestVoteRequest, AnyEpoch)
         /\ s = m.dest
-        /\ LET peer     == m.source
-               error    == IF m.epoch < current_epoch[s]
+        /\ peer = m.source
+        /\ LET error    == IF m.epoch < current_epoch[s]
                            THEN FencedLeaderEpoch
                            ELSE Nil
                state0   == IF m.epoch > current_epoch[s]
@@ -254,9 +283,9 @@ HandleVoteRequest(s) ==
                        \* if a follower changed state then clear pending_fetch
                        \* if a leader changed state, then fail any pending writes
                        /\ IF state # state'
-                          THEN /\ pending_fetch' = [pending_fetch EXCEPT ![s] = Nil]
+                          THEN /\ ResetFetchState(s)
                                /\ FailPendingWrites(s)
-                          ELSE UNCHANGED << pending_fetch, pending_ack, invVars >>
+                          ELSE UNCHANGED << fetch_state, pending_ack, invVars >>
                        /\ Reply(m, [type         |-> RequestVoteResponse,
                                     epoch        |-> m.epoch,
                                     leader       |-> final_state.leader,
@@ -271,7 +300,7 @@ HandleVoteRequest(s) ==
                                     error        |-> error,
                                     source       |-> s,
                                     dest         |-> peer])
-                       /\ UNCHANGED << pending_fetch, pending_ack, invVars>>
+                       /\ UNCHANGED << fetch_state, pending_ack, invVars>>
                /\ UNCHANGED <<server_ids, role, config, leaderVars, logVars, auxVars>>
 
 (* 
@@ -283,15 +312,15 @@ HandleVoteRequest(s) ==
     - the server is not a Candidate anymore
     - the request epoch is lower than the server epoch.
 *)
-HandleVoteResponse(s) ==
+HandleVoteResponse(s, peer) ==
     \* enabling conditions
     \E m \in Messages :
         /\ ReceivableMessage(m, RequestVoteResponse, AnyEpoch)
         /\ s = m.dest
+        /\ peer = m.source
         /\ role[s] = Voter \* new check because roles can change with reconfigurations
         \* state mutations
-        /\ LET peer == m.source
-               state0 == MaybeHandleCommonResponse(s, m.leader, m.epoch, m.error)
+        /\ LET state0 == MaybeHandleCommonResponse(s, m.leader, m.epoch, m.error)
                state1 == IF /\ state0.handled = FALSE
                             /\ state[s] = Candidate
                             /\ m.vote_granted
@@ -299,7 +328,7 @@ HandleVoteResponse(s) ==
                          ELSE state0
            IN /\ ApplyState(s, state1)
               /\ Discard(m)
-              /\ UNCHANGED <<server_ids, config, role, pending_fetch, 
+              /\ UNCHANGED <<server_ids, config, role, fetch_state, 
                              pending_ack, leaderVars, logVars, invVars, auxVars>>               
 
 (*
@@ -327,13 +356,51 @@ BecomeLeader(s) ==
              THEN hwm' = [hwm EXCEPT ![s] = Len(new_log)]
              ELSE UNCHANGED hwm
           /\ ResetFollowerEndOffsetMap(s, config[s].members)
+          /\ ResetFetchState(s)
           /\ SendAllOnce(
-                  {[type    |-> BeginQuorumRequest,
+                  {[type    |-> BeginQuorumEpochRequest,
                     epoch   |-> current_epoch[s],
                     source  |-> s,
                     dest    |-> peer] : peer \in config[s].members \ {s}})
-          /\ UNCHANGED <<server_ids, config, role, pending_fetch, pending_ack, 
+          /\ UNCHANGED <<server_ids, config, role, pending_ack, 
                          hwm, invVars, auxVars>>
+
+(*
+    ACTION: ResendBeginQuorumEpochRequest -------------------------------------------
+    Server (s) is a voter in the Leader state. It needs to resend
+    a follower the BeginQuorumEpochRequest because the follower
+    did not receive it the first time.
+*)
+                      
+NeedsResend(s, peer) ==
+    (* This is not logic executed by the server, but a global condition
+       used by this spec to ensure a BeginQuorumEpochRequest is resent
+       when needed. The implementation tracks whether it ever received
+       a response and if it hasn't, after some time period, it resends it. *)
+    \* The last one got dropped
+    /\ ~InflightOrProcessed(s, peer, BeginQuorumEpochRequest)
+    \* There is a connection
+    /\ Connected(s, peer)
+    \* The peer has a stale epoch or is not a follower yet
+    /\ \/ current_epoch[s] > current_epoch[peer]
+       \/ /\ current_epoch[s] = current_epoch[peer]
+          /\ state[peer] # Follower
+
+ResendBeginQuorumEpochRequest(s, peer) ==
+    \* enabling conditions
+    /\ TestLiveness = TRUE
+    /\ s \in StartedServers
+    /\ state[s] = Leader
+    /\ s # peer
+    /\ peer \in config[s].members
+    /\ NeedsResend(s, peer)
+    \* state mutations
+    /\ Send([type    |-> BeginQuorumEpochRequest,
+             epoch   |-> current_epoch[s],
+             source  |-> s,
+             dest    |-> peer])
+    /\ UNCHANGED <<logVars, serverVars, leaderVars, candidateVars,
+                   invVars, auxVars, server_ids>>  
 
 (* 
     ACTION: AcceptBeginQuorumRequest -------------------------------------------
@@ -347,20 +414,20 @@ BecomeLeader(s) ==
     continue to fetch until it reaches the record where it gets added
     as a voter. 
 *)
-AcceptBeginQuorumRequest(s) ==
+AcceptBeginQuorumRequest(s, peer) ==
     \* enabling conditions
     \E m \in Messages :
-        /\ ReceivableMessage(m, BeginQuorumRequest, AnyEpoch)
+        /\ ReceivableMessage(m, BeginQuorumEpochRequest, AnyEpoch)
         /\ s = m.dest
-        /\ LET peer     == m.source
-               error    == IF m.epoch < current_epoch[s]
+        /\ peer = m.source
+        /\ LET error    == IF m.epoch < current_epoch[s]
                            THEN FencedLeaderEpoch
                            ELSE Nil
                new_state == MaybeTransition(s, peer, m.epoch)
            IN /\ error = Nil
               \* state mutations
               /\ ApplyState(s, new_state)
-              /\ pending_fetch' = [pending_fetch EXCEPT ![s] = Nil]
+              /\ ResetFetchState(s)
               /\ FailPendingWrites(s)
               /\ Discard(m)
         /\ UNCHANGED <<server_ids, config, role, logVars, leaderVars, auxVars>>
@@ -379,7 +446,8 @@ AcceptBeginQuorumRequest(s) ==
 WithinValuesPerEpochLimit(s, v) ==
     (* State space limit trick*)
     Quantify(DOMAIN log[s], LAMBDA offset : 
-                        log[s][offset].epoch = current_epoch[s])
+                        /\ log[s][offset].epoch = current_epoch[s]
+                        /\ log[s][offset].command = AppendCommand)
         < MaxValuesPerEpoch
 
 ClientRequest(s) ==
@@ -401,7 +469,7 @@ ClientRequest(s) ==
                /\ pending_ack' = [pending_ack EXCEPT ![s] = @ \union {v}]
                /\ inv_sent' = inv_sent \union {v}
         /\ UNCHANGED <<server_ids, config, current_epoch, role, state, voted_for, 
-                       leader, pending_fetch, NetworkVars, candidateVars,
+                       leader, fetch_state, NetworkVars, candidateVars,
                        leaderVars, inv_pos_acked, inv_neg_acked, auxVars>>
                        
 (* 
@@ -416,49 +484,49 @@ ClientRequest(s) ==
     Once the leader has committed the reconfig command it will resign
     and reject further fetch requests.
 *)
-SendFetchRequest(s) ==
+SendFetchRequest(s, peer) ==
     \* enabling conditions
     /\ s \in StartedServers
-    /\ \E peer \in StartedServers : 
-        /\ s # peer
-        /\ pending_fetch[s] = Nil
-        /\ \* either the follower (voter or observer) knows who the 
-           \* leader is and can send a fetch request to the leader
-           \/ /\ leader[s] = peer
-              /\ state[s] = Follower
-           \* or we're an observer that doesn't know who the leader 
-           \* is (either unattached or voted) and picks a random voter to
-           \* fetch from, knowing that if it isn't the leader, it will
-           \* include the leader id in its response if it knows.
-           \/ /\ role[s] = Observer
-              /\ state[s] \in {Unattached, Voted}
-              /\ Connected(s, peer)
-              \* CHEATING, to prevent a cycle of always sending it to a 
-              \* server that is not the leader and doesn't know who the
-              \* leader is, choose a voter that does know. 
-              \* In reality, who this server sends a fetch request
-              \* to is governed by a voter set in configuration. This spec
-              \* assumes that the server is given the set of voters it can
-              \* send its first fetch to.
-              /\ role[peer] = Voter
-              /\ leader[peer] # Nil
-        \* state mutations
-        /\ LET last_log_offset == Len(log[s])
-               last_log_epoch  == IF last_log_offset > 0 
-                                  THEN log[s][last_log_offset].epoch
-                                  ELSE 0
-               fetch_msg    == [type               |-> FetchRequest,
-                                epoch              |-> current_epoch[s],
-                                fetch_offset       |-> last_log_offset + 1,
-                                last_fetched_epoch |-> last_log_epoch,
-                                observer           |-> role[s] = Observer,
-                                source             |-> s,
-                                dest               |-> peer]
-           IN /\ pending_fetch' = [pending_fetch EXCEPT ![s] = fetch_msg]
-              /\ Send(fetch_msg)
-        /\ UNCHANGED <<server_ids, config, role, current_epoch, state, 
-                       voted_for, leader, pending_ack, candidateVars, leaderVars, 
-                       logVars, invVars, auxVars>>
+    /\ peer \in StartedServers
+    /\ s # peer
+    /\ fetch_state[s].pending_fetch = Nil
+    /\ \* either the follower (voter or observer) knows who the 
+       \* leader is and can send a fetch request to the leader
+       \/ /\ leader[s] = peer
+          /\ state[s] = Follower
+       \* or we're an observer that doesn't know who the leader 
+       \* is (either unattached or voted) and picks a random voter to
+       \* fetch from, knowing that if it isn't the leader, it will
+       \* include the leader id in its response if it knows.
+       \/ /\ role[s] = Observer
+          /\ state[s] \in {Unattached, Voted}
+          /\ Connected(s, peer)
+          \* CHEATING, to prevent a cycle of always sending it to a 
+          \* server that is not the leader and doesn't know who the
+          \* leader is, choose a voter that does know. 
+          \* In reality, who this server sends a fetch request
+          \* to is governed by a voter set in configuration. This spec
+          \* assumes that the server is given the set of voters it can
+          \* send its first fetch to.
+          /\ role[peer] = Voter
+          /\ leader[peer] # Nil
+    \* state mutations
+    /\ LET last_log_offset == Len(log[s])
+           last_log_epoch  == IF last_log_offset > 0 
+                              THEN log[s][last_log_offset].epoch
+                              ELSE 0
+           fetch_msg    == [type               |-> FetchRequest,
+                            epoch              |-> current_epoch[s],
+                            fetch_offset       |-> last_log_offset + 1,
+                            last_fetched_epoch |-> last_log_epoch,
+                            observer           |-> role[s] = Observer,
+                            source             |-> s,
+                            dest               |-> peer]
+       IN /\ UpdateFetchStateWithFetchReq(s, fetch_msg)
+          /\ Send(fetch_msg)
+    /\ UNCHANGED <<server_ids, config, role, current_epoch, state, 
+                   voted_for, leader, pending_ack, candidateVars, leaderVars, 
+                   logVars, invVars, auxVars>>
 
 (* NOTE: Fetch requests --------------------------------
     Note 1:
@@ -654,7 +722,7 @@ AcceptFetchRequestFromVoter(s, peer) ==
                                  source      |-> s,
                                  dest        |-> peer,
                                  correlation |-> m])                    
-                    /\ UNCHANGED <<server_ids, log, pending_fetch, inv_sent, 
+                    /\ UNCHANGED <<server_ids, log, fetch_state, inv_sent, 
                                    inv_neg_acked, aux_ctrs, aux_disk_id_gen>>
 
 (* 
@@ -717,11 +785,12 @@ AcceptFetchRequestFromObserver(s, peer) ==
    leader. See MaybeHandleCommonResponse for logic flow.
 *)
 
-HandleFetchResponse(s) ==
+HandleFetchResponse(s, peer) ==
     \* enabling conditions
     \E m \in Messages :
         /\ ReceivableMessage(m, FetchResponse, AnyEpoch)
         /\ s = m.dest
+        /\ peer = m.source
         /\ LET new_state    == MaybeHandleCommonResponse(s, m.leader, m.epoch, m.error)
                new_log      == CASE m.result = Ok ->
                                    IF Len(m.entries) > 0
@@ -734,19 +803,18 @@ HandleFetchResponse(s) ==
                curr_config  == ConfigFor(config_entry.offset,
                                          config_entry.entry,
                                          m.hwm)
-           IN /\ pending_fetch[s] = m.correlation
+           IN /\ fetch_state[s].pending_fetch = m.correlation
               /\ IF \/ new_state.handled = TRUE
                     \/ state[s] # Follower
                  THEN /\ ApplyState(s, new_state)
-                      /\ pending_fetch' = [pending_fetch EXCEPT ![s] = Nil]
                       /\ UNCHANGED << role, log, hwm, config, flwr_end_offset >>
                  ELSE /\ MaybeSwitchConfigurations(s, curr_config, new_state)
-                      /\ pending_fetch' = [pending_fetch EXCEPT ![s] = Nil]
                       /\ log' = new_log
                       /\ IF m.result = Ok
                          THEN hwm' = [hwm  EXCEPT ![s] = m.hwm]
                          ELSE UNCHANGED hwm
                       /\ UNCHANGED voted_for
+              /\ UpdateFetchStateWithFetchRes(s, m)
               /\ Discard(m)
               /\ UNCHANGED <<server_ids, pending_ack, invVars, auxVars>>
 
@@ -798,7 +866,7 @@ StartNewServer ==
                  /\ current_epoch' = current_epoch @@ (new_server :> 0)
                  /\ leader' = leader @@ (new_server :> Nil)
                  /\ voted_for' = voted_for @@ (new_server :> Nil)
-                 /\ pending_fetch' = pending_fetch @@ (new_server :> fetch_msg) 
+                 /\ fetch_state' = fetch_state @@ (new_server :> BlankFetchState) 
                  /\ pending_ack' = pending_ack @@ (new_server :> {})
                  /\ votes_recv' = votes_recv @@ (new_server :> {})
                  /\ flwr_end_offset' = flwr_end_offset @@ (new_server :> EmptyMap)
@@ -871,13 +939,13 @@ AcceptAddVoterRequest(s) ==
            IN  /\ log' = [log EXCEPT ![s] = new_log]
                /\ config' = [config EXCEPT ![s] = new_config]
                /\ UpdateFollowerEndOffsetMap(s, new_config.members)
-               /\ Send([type    |-> BeginQuorumRequest,
+               /\ Send([type    |-> BeginQuorumEpochRequest,
                         epoch   |-> current_epoch[s],
                         source  |-> s,
                         dest    |-> add_server])
         /\ aux_ctrs' = [aux_ctrs EXCEPT !.add_reconfig_ctr = @ + 1]
         /\ UNCHANGED <<server_ids, candidateVars, role, current_epoch, state, 
-                       leader, voted_for, pending_fetch, pending_ack,
+                       leader, voted_for, fetch_state, pending_ack,
                        hwm, invVars, aux_disk_id_gen>>
 
 (* 
@@ -943,7 +1011,7 @@ AcceptRemoveVoterRequest(s) ==
                   ELSE UNCHANGED role
                /\ aux_ctrs' = [aux_ctrs EXCEPT !.remove_reconfig_ctr = @ + 1]                                 
         /\ UNCHANGED <<server_ids, NetworkVars, candidateVars,  current_epoch, 
-                       state, leader, voted_for, pending_fetch, pending_ack,
+                       state, leader, voted_for, fetch_state, pending_ack,
                        hwm, invVars, aux_disk_id_gen>>  
 
 \* Network connectivity changes --------------------
@@ -984,7 +1052,8 @@ InitServerVars(init_leader, server_identities) ==
                                               ELSE Follower]
         /\ leader        = [s \in servers |-> init_leader]
         /\ voted_for     = [s \in servers |-> Nil]
-        /\ pending_fetch = [s \in servers |-> Nil]
+        /\ fetch_state = [s \in servers |-> [pending_fetch     |-> Nil,
+                                             last_fetch_res    |-> Nil]]
         /\ pending_ack   = [s \in servers |-> {}]
         /\ config        = [s \in servers |-> [id        |-> 1,
                                                members   |-> servers,
@@ -1040,8 +1109,9 @@ Init == LET servers     == 1..InitClusterSize
             /\ InitAuxVars       
 
 Next == 
-    \* server starts/restarts/crashes--------------
     \/ StartNewServer
+    \/ ChangeNetworkConnectivity
+    \* ### Single server actions ######################
     \/ \E s \in AllServers :
         \/ RestartWithState(s)
         \/ CrashLoseState(s)
@@ -1050,23 +1120,27 @@ Next ==
         \/ AcceptRemoveVoterRequest(s)
         \* elections ------------------------------
         \/ SendRequestVote(s)
-        \/ HandleVoteRequest(s)
-        \/ HandleVoteResponse(s)
         \/ BecomeLeader(s)
-        \* follower actions -----------------------
-        \/ AcceptBeginQuorumRequest(s)
-        \/ SendFetchRequest(s)
-        \/ HandleFetchResponse(s)
-        \/ ObserverFetchTimeout(s)
         \* leader actions -------------------------
         \/ ClientRequest(s)
-    \/ \E s, peer \in AllServers :        
+        \/ CheckQuorumResign(s)
+        \* follower actions -----------------------
+        \/ ObserverFetchTimeout(s)
+    \* ### Send/receive actions ######################
+    \/ \E s, peer \in AllServers :    
+        \* elections
+        \/ HandleVoteRequest(s, peer)
+        \/ HandleVoteResponse(s, peer)
+        \* follower actions -----------------------
+        \/ AcceptBeginQuorumRequest(s, peer)
+        \/ SendFetchRequest(s, peer)
+        \/ HandleFetchResponse(s, peer)
+        \* leader message send/receive ------------     
+        \/ ResendBeginQuorumEpochRequest(s, peer)
         \/ RejectFetchRequest(s, peer)
         \/ DivergingFetchRequest(s, peer)
         \/ AcceptFetchRequestFromVoter(s, peer)
         \/ AcceptFetchRequestFromObserver(s, peer)
-    \* network connectivity -----------------------
-    \/ ChangeNetworkConnectivity
 
 (*
     FAIRNESS notes.
@@ -1079,19 +1153,21 @@ Next ==
 *)    
 Fairness ==
     \A s \in AllServers :
+        /\ WF_vars(CheckQuorumResign(s))
         /\ WF_vars(ObserverFetchTimeout(s))
         /\ WF_vars(SendRequestVote(s))
-        /\ WF_vars(HandleVoteRequest(s))
-        /\ WF_vars(HandleVoteResponse(s))
         /\ WF_vars(BecomeLeader(s))
-        /\ WF_vars(AcceptBeginQuorumRequest(s))
-        /\ WF_vars(SendFetchRequest(s))
-        /\ WF_vars(HandleFetchResponse(s))
         /\ \A peer \in AllServers :
+            /\ WF_vars(HandleVoteRequest(s, peer))
+            /\ WF_vars(HandleVoteResponse(s, peer))
             /\ WF_vars(RejectFetchRequest(s, peer))
             /\ WF_vars(DivergingFetchRequest(s, peer))
             /\ WF_vars(AcceptFetchRequestFromVoter(s, peer))
             /\ WF_vars(AcceptFetchRequestFromObserver(s, peer))
+            /\ WF_vars(AcceptBeginQuorumRequest(s, peer))
+            /\ WF_vars(ResendBeginQuorumEpochRequest(s, peer))
+            /\ WF_vars(SendFetchRequest(s, peer))
+            /\ WF_vars(HandleFetchResponse(s, peer))
 
 Spec == Init /\ [][Next]_vars
 LivenessSpec == Init /\ [][Next]_vars /\ Fairness
