@@ -1,14 +1,12 @@
 # The Kafka Replication Protocol with KIP-966
 
-BASED ON A DRAFT KIP! DETAILS MAY CHANGE.
-
 This document is a description of the Kafka replication protocol with [KIP-966](https://cwiki.apache.org/confluence/display/KAFKA/KIP-966%3A+Eligible+Leader+Replicas). The objective is to provide a description that is similar to the descriptions of other protocols such as [Raft](https://raft.github.io/raft.pdf), [Multi-Paxos](https://dada.cs.washington.edu/research/tr/2009/09/UW-CSE-09-09-02.PDF) and [Viewstamped Replication Revisited](https://pmg.csail.mit.edu/papers/vr-revisited.pdf). This is not a research paper, there are no novel approaches proposed - it is simply a description of how the Apache Kafka replication protocol works. Everything you read here is the product of an open-source community of engineers that has evolved Apache Kafka since its inception.
 
 ## KIP-966
 
 This KIP was introduced for the following reasons:
 
-1. Fixes the Last Replica Standing issue, documented in the 3.5 protocol description (coming soon).
+1. Fixes the Last Replica Standing issue, documented in the 3.5 protocol description, also found in this repository.
 2. Strengthens the role of `min.insync.replicas` to make it the minimum replication factor of committed log records (bar broker failures).
 3. Improves durability when clean elections are not possible by introducing a more sophisticated recovery mechanism.
 
