@@ -1,0 +1,348 @@
+# Kafka Transactions
+
+# ----------------------------------------------
+# Model parameters
+# ----------------------------------------------
+
+NUM_BROKERS = 1 
+NUM_CLIENTS = 2
+NUM_TXN_LOG_PARTITIONS = 1
+NUM_TRANSACTION_IDS = 1
+
+# ----------------------------------------------
+# Constants
+# ----------------------------------------------
+
+Messages = enum('InitPidRequest', 'InitPidResponse')
+ClientState = enum('Ready', 'SentInitPidRequest', 'HasPid')
+TxnState = enum('Empty', 'Begin', 'PrepareCommit', 'PrepareAbort',
+              	'CompleteAbort', 'CompleteCommit', 'Ongoing', 'PrepareEpochFence',
+                'Dead')
+TxnResult = enum('Abort', 'Commit')
+
+ValidPrevTxnStates = dict()
+ValidPrevTxnStates[TxnState.Empty] = [TxnState.Empty, TxnState.CompleteCommit, TxnState.CompleteAbort]
+ValidPrevTxnStates[TxnState.Ongoing] = [TxnState.Ongoing, TxnState.Empty, TxnState.CompleteCommit, TxnState.CompleteAbort]
+ValidPrevTxnStates[TxnState.PrepareCommit] = [TxnState.Ongoing]
+ValidPrevTxnStates[TxnState.PrepareAbort] = [TxnState.Ongoing, TxnState.PrepareEpochFence]
+ValidPrevTxnStates[TxnState.CompleteCommit] = [TxnState.PrepareCommit]
+ValidPrevTxnStates[TxnState.CompleteAbort] = [TxnState.PrepareAbort]
+ValidPrevTxnStates[TxnState.Dead] = [TxnState.Empty, TxnState.CompleteCommit, TxnState.CompleteAbort]
+ValidPrevTxnStates[TxnState.PrepareEpochFence] = [TxnState.Ongoing]
+
+ErrorCodes = enum('OK', 'NotCoordinatorForTransactionalId', 'ConcurrentTransactions',
+                  'IllegalState', 'ProducerFenced', 'InvalidTxnState',
+                  'NotSupportedYet')
+
+# ----------------------------------------------
+# Network
+# ----------------------------------------------
+
+atomic func NetReply(source, recv_msg, send_msg):
+    # Add the reply message to the net buffer of the dest
+    net_input_buff[recv_msg.source].add(send_msg)
+    # Remove the processed message from the net buffer of the source
+    net_input_buff[source].remove(recv_msg)
+    # Log this processed message (for easier debugging, comment out for state space reduction)
+    net_processed[source].add(recv_msg)
+
+atomic func NetSend(dest, msg):
+    net_input_buff[dest].add(msg)
+
+atomic func NetMsgProcessed(source, msg):
+    # Remove the processed message from the net buffer of the source
+    net_input_buff[source].remove(msg)
+    # Log this processed message (for easier debugging, comment out for state space reduction)
+    net_processed[source].add(msg)
+
+# ----------------------------------------------
+# Client role
+# ----------------------------------------------
+
+role Client:
+	action Init:
+    	self.state = ClientState.Ready
+    	self.tid = None
+        self.pid = -1
+    	self.epoch = -1
+        self.last_state = None
+        self.last_error = None
+
+	atomic fair<strong> action SendInitPidRequest:
+        require self.state == ClientState.Ready
+
+        tid = any range(NUM_TRANSACTION_IDS)
+        self.tid = tid
+
+        # Don't bother modeling FindCoordinator, just allow a client
+        # to send an InitPidRequest to any broker. If the broker is
+        # not the coordinator then it will return an error else, it will
+        # carry out the InitPidRequest logic.
+    	broker_id = fair any range(NUM_BROKERS)
+        payload = record(type = Messages.InitPidRequest,
+                         tid = tid,
+                         source = self.CLIENT_ID)
+        NetSend(broker_id, payload)
+        self.state = ClientState.SentInitPidRequest
+
+    atomic fair action RecvInitPidResponse:
+        require self.state == ClientState.SentInitPidRequest
+
+        msg = any net_input_buff[self.CLIENT_ID] : msg.type == Messages.InitPidResponse
+
+        if msg.code == ErrorCodes.OK:
+            self.pid = msg.pid
+            self.pepoch = msg.pepoch
+            self.state = ClientState.HasPid
+        else:
+            # Go back to Ready, so the client can try again
+            self.last_state = self.state
+            self.last_error = msg.code
+            self.state = ClientState.Ready
+
+        NetMsgProcessed(self.CLIENT_ID, msg)
+
+# ----------------------------------------------
+# Transaction Log Partition role
+# ----------------------------------------------
+
+role TransactionLogPartition:
+    action Init:
+        self.log = []
+        self.hwm = -1
+
+    atomic func Append(entry):
+        self.log.append(entry)
+
+    atomic func AdvanceHwmAndReturnEntry():
+        next = self.hwm + 1
+        self.hwm = next
+        return self.log[next]
+
+    atomic func NextCommittedEntryMatch(state):
+        if len(self.log) > self.hwm:
+            next = self.hwm + 1
+            return self.log[next].transition.state == state
+        
+        return False
+
+# ----------------------------------------------
+# Transaction Coordinator role
+# ----------------------------------------------
+
+role TransactionCoordinator:
+	action Init:
+    	self.txn_metadata = dict()
+        self.txn_transition = dict()
+        self.partition_metadata = dict()
+
+    atomic func BecomeLeader(partition, coordinator_epoch):
+        self.partition_metadata[partition] = record(cepoch = coordinator_epoch)
+
+    atomic func PartitionFor(tid):
+        return tid % NUM_TXN_LOG_PARTITIONS
+
+    atomic func GetTransactionMetadata(tid):
+        # Check we're the right TC
+        partition = self.PartitionFor(tid)
+        if partition not in self.partition_metadata:
+            return record(code = ErrorCodes.NotCoordinatorForTransactionalId)
+        
+        # The TID metadata exists already, just return what is cached.
+        if tid in self.txn_metadata:
+            txn_metadata = self.txn_metadata[tid]
+            partition = self.PartitionFor(tid)
+            return record(code = ErrorCodes.OK, 
+                          metadata = txn_metadata, 
+                          cepoch = self.partition_metadata[partition].cepoch)
+        
+        # This is a new TID, so generate new metadata, including a new PID and an pepoch of -1.
+        else:
+            new_pid = pid_source + 1
+            pid_source = new_pid # updates an auxilliary variable for producing unique pids
+            
+            txn_metadata = record(pid = new_pid, last_pid = -1, 
+                                  pepoch = -1, last_pepoch = -1,
+                                  state = TxnState.Empty, 
+                                  pending_state = None,
+                                  partitions = set())
+            
+            # Store the transaction state and return it along with the coordinator epoch
+            self.txn_metadata[tid] = txn_metadata
+            
+            return record(code = ErrorCodes.OK, 
+                          metadata = txn_metadata, 
+                          cepoch = self.partition_metadata[partition].cepoch)
+
+    atomic func GetTransitionTo(tid, new_state, new_pid, new_pepoch, new_last_pepoch, new_partitions):
+        # There is a transition in progress for this TID, then return ConcurrentTransactions error
+        if tid in self.txn_transition:
+            return record(code = ErrorCodes.ConcurrentTransactions)
+        
+        # This is a valid transition so generate a transition object
+        elif new_state in ValidPrevTxnStates[self.txn_metadata[tid].state]:
+            transition = record(pid = new_pid, last_pid = self.txn_metadata[tid].pid, 
+                                pepoch = new_pepoch, last_pepoch = new_last_pepoch,
+                                state = new_state, partitions = new_partitions)
+
+            return record(code = ErrorCodes.OK, transition = transition)
+        
+        # We have a bug, so return an IllegalState error.
+        else:
+            return record(code = ErrorCodes.IllegalState)
+
+    atomic func InitProducerIdTransition(tid, cepoch):
+        txn_metadata = self.txn_metadata[tid]
+
+        # The current state is Empty        
+        if (txn_metadata.state == TxnState.Empty):
+
+            # Increment the producer epoch
+            producer_epoch = txn_metadata.pepoch + 1
+            last_producer_epoch = txn_metadata.pepoch
+            
+            result = self.GetTransitionTo(tid, TxnState.Empty, txn_metadata.pid,
+                                          producer_epoch, last_producer_epoch, [])
+            return result
+
+        # Shouldn't get here, this is a bug
+        return record(code = ErrorCodes.IllegalState)
+
+    atomic fair action ReceiveInitPidRequest:
+        req = any net_input_buff[self.BROKER_ID] : req.type == Messages.InitPidRequest
+
+    	# Load any TID state that exists
+        result = self.GetTransactionMetadata(req.tid)
+        
+        # A condition was not met, so immediately return an error.
+        if result.code != ErrorCodes.OK:
+            msg = record(type = Messages.InitPidResponse,
+                         code = result.code,
+                         pid = -1, pepoch = -1, 
+                         source = self.BROKER_ID)
+            NetReply(self.BROKER_ID, req, msg)
+            return
+
+        # Create a txn metadata transition to be written to the txn log.
+        cepoch = result.cepoch
+        result = self.InitProducerIdTransition(req.tid, cepoch)
+
+        # The transition was created successfully, now write it to the txn log.
+        # Once committed, the transition will take effect and the TC will send a response.
+        if result.code == ErrorCodes.OK:
+            self.txn_transition[req.tid] = result.transition
+            partition = self.PartitionFor(req.tid)
+            entry = record(tid = req.tid,
+                           client_id = req.source,
+                           transition = result.transition)
+            
+            txn_log_part = txn_log_partitions[partition]
+            txn_log_part.Append(entry)
+            NetMsgProcessed(self.BROKER_ID, req) # The response will be sent when the log entry gets committed
+        
+        # A condition was not met, so immediately return an error response.
+        else:
+            msg = record(type = Messages.InitPidResponse, 
+                         code = result.code, 
+                         pid = -1, pepoch = -1, 
+                         dest = req.source, 
+                         source = self.BROKER_ID)
+            NetReply(self.BROKER_ID, req, msg)
+
+    atomic fair action CompleteInitPidRequest:
+        # Non-deterministically select a TID that has a transition underway.
+        tid = any self.txn_transition : self.txn_transition[tid] != None
+                
+        # Check if the next txn log entry to get committed will commit an
+        # InitPidRequest (known because it has an Empty txn state).
+        part = self.PartitionFor(tid)
+        txn_log_part = txn_log_partitions[part]
+        can_complete = txn_log_part.NextCommittedEntryMatch(TxnState.Empty)
+        require can_complete
+
+        # The HWM advances
+        entry = txn_log_part.AdvanceHwmAndReturnEntry()
+
+        # Remove the pending transition and apply it to the txn metadata
+        self.txn_transition.pop(tid)
+        self.txn_metadata[tid] = entry.transition
+
+        # Send a success InitPidResponse to the client.
+        msg = record(type = Messages.InitPidResponse, 
+                     code = ErrorCodes.OK, 
+                     pid = entry.transition.pid, 
+                     pepoch = entry.transition.pepoch, 
+                     source = self.BROKER_ID)
+        NetSend(entry.client_id, msg)
+
+# ----------------------------------------------
+# Initital state of the specification
+# ----------------------------------------------
+
+action Init:
+	# An auxilliary variable for generating unique pids
+    pid_source = 0
+
+    # The network
+    net_input_buff = {}
+    net_processed = {} # optional, for easier debugging
+    
+    # The transaction log
+    txn_log_partitions = []
+    for part in range(NUM_TXN_LOG_PARTITIONS):
+        txn_log_partitions.append(TransactionLogPartition(PART=part))
+    
+    # The transaction coordinators
+    txn_coordinators = []
+    for broker_id in range(NUM_BROKERS):
+        # Create a TC for this broker
+        tc = TransactionCoordinator(BROKER_ID=broker_id)
+        txn_coordinators.append(tc)
+        # Add a network for broker
+        net_input_buff[broker_id] = genericset()
+        net_processed[broker_id] = genericset()
+
+    # Distribute partitions evenly over coordinators
+    # Later we'll model TC partition leader elections.
+    parts = list(range(NUM_TXN_LOG_PARTITIONS))
+    while parts:
+        for tc in txn_coordinators:
+            if parts:
+                partition = parts.pop(0)
+                tc.BecomeLeader(partition, 1)  # Assign partition to coordinator
+
+    # Create the clients
+    clients = []
+    for client_id in range(NUM_CLIENTS):
+        client_id += 100 # to prevent collisions on network
+        client = Client(CLIENT_ID=client_id)
+        clients.append(client)
+        # Add a network for client
+        net_input_buff[client_id] = genericset()
+        net_processed[client_id] = genericset()
+
+# ----------------------------------------------
+# Invariants
+# ----------------------------------------------
+
+always assertion NoIllegalState:
+    for node in net_input_buff:
+        for msg in net_input_buff[node]:
+            if getattr(msg, 'code', None) == ErrorCodes.IllegalState:
+                return False
+
+    return True
+
+always assertion TestInv:
+    return True
+
+# ----------------------------------------------
+# Liveness properties
+# ----------------------------------------------
+
+always eventually assertion EventuallyAllClientsGetPid:
+    for client in clients:
+        if client.state != ClientState.HasPid:
+            return False
+  
+    return True
