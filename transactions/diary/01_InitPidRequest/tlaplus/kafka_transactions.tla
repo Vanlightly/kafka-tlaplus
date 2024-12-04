@@ -382,35 +382,45 @@ Next ==
 EmptyMap == [x \in {} |-> None]
 EmptyTxnState == [tid \in TransactionIds |-> None]
 
+BalancedTidToPartSpread(mapping) ==
+    \* Ensure the tid -> txn log partition mapping is evenly distributed.
+    \A p1, p2 \in TxnLogPartitions :
+        Quantify(DOMAIN mapping, LAMBDA tid : mapping[tid] = p1)
+            - Quantify(DOMAIN mapping, LAMBDA tid : mapping[tid] = p2) \in {-1, 0, 1}
+            
+BalancedBrokerToPartLeadership(mapping) ==
+    \* Ensure that each partition has a leader.
+    /\ \A p \in TxnLogPartitions : \E b \in Brokers : p \in mapping[b]
+    \* Ensure that each broker is the leader of disjoint subsets of txn log partitions
+    /\ ~\E b1, b2 \in Brokers : 
+        /\ b1 # b2
+        /\ (mapping[b1] \intersect mapping[b2]) # {}
+        \* And that the partitions are evenly spread
+        /\ Cardinality(mapping[b1]) - Cardinality(mapping[b2]) \in {-1, 0, 1}
+
 Init ==
-    \E tid_to_part_mapping \in [TransactionIds -> TxnLogPartitions] : 
-        \E b_partitions \in [Brokers -> SUBSET TxnLogPartitions] :
-            \* CONSTRAIN THE MAPPINGS START ----
-            \* Ensure that each partition has a leader.
-            /\ \A p \in TxnLogPartitions : \E b \in Brokers : p \in b_partitions[b]
-            \* Ensure that each broker is the leader of disjoint subsets of txn log partitions
-            /\ ~\E b1, b2 \in Brokers : 
-                /\ b1 # b2
-                /\ (b_partitions[b1] \intersect b_partitions[b2]) # {}
-            \* CONSTRAIN THE MAPPINGS END ----
-            \* Set the variables
-            /\ client = [c \in Clients |-> 
-                            [state      |-> Ready,
-                             tid        |-> None,
-                             pid        |-> -1,
-                             epoch      |-> -1,
-                             last_state |-> None,
-                             last_error |-> None]]
-            /\ tc_txn_metadata = [b \in Brokers |-> [tid \in TransactionIds |-> None]]
-            /\ tc_txn_transition = [b \in Brokers |-> [tid \in TransactionIds |-> None]]
-            /\ tc_part_metadata = [b \in Brokers |-> 
-                                    [p \in b_partitions[b] |-> 
-                                        [cepoch |-> 1]]]
-            /\ txn_log = [p \in TxnLogPartitions |-> <<>>]
-            /\ txn_log_hwm = [p \in TxnLogPartitions |-> 0] \* inclusive
-            /\ t_to_p_mapping = tid_to_part_mapping
-            /\ pid_source = 0
-            /\ NetworkInit
+    LET tid_to_part_mapping == CHOOSE mapping \in [TransactionIds -> TxnLogPartitions] :
+                                            BalancedTidToPartSpread(mapping) 
+        b_partitions        == CHOOSE mapping \in [Brokers -> SUBSET TxnLogPartitions] :
+                                            BalancedBrokerToPartLeadership(mapping)
+    IN
+        /\ client = [c \in Clients |-> 
+                        [state      |-> Ready,
+                         tid        |-> None,
+                         pid        |-> -1,
+                         epoch      |-> -1,
+                         last_state |-> None,
+                         last_error |-> None]]
+        /\ tc_txn_metadata = [b \in Brokers |-> [tid \in TransactionIds |-> None]]
+        /\ tc_txn_transition = [b \in Brokers |-> [tid \in TransactionIds |-> None]]
+        /\ tc_part_metadata = [b \in Brokers |-> 
+                                [p \in b_partitions[b] |-> 
+                                    [cepoch |-> 1]]]
+        /\ txn_log = [p \in TxnLogPartitions |-> <<>>]
+        /\ txn_log_hwm = [p \in TxnLogPartitions |-> 0] \* inclusive
+        /\ t_to_p_mapping = tid_to_part_mapping
+        /\ pid_source = 0
+        /\ NetworkInit
 
 \* Note that SendInitPidRequest requires strong fairness because
 \* sending to another broker will disable the action. So we need
