@@ -60,15 +60,15 @@ atomic func NetMsgProcessed(source, msg):
 # ----------------------------------------------
 
 role Client:
-	action Init:
-    	self.state = ClientState.Ready
-    	self.tid = None
+    action Init:
+        self.state = ClientState.Ready
+        self.tid = None
         self.pid = -1
-    	self.epoch = -1
+        self.epoch = -1
         self.last_state = None
         self.last_error = None
 
-	atomic fair<strong> action SendInitPidRequest:
+    atomic fair<strong> action SendInitPidRequest:
         require self.state == ClientState.Ready
 
         tid = any range(NUM_TRANSACTION_IDS)
@@ -131,8 +131,8 @@ role TransactionLogPartition:
 # ----------------------------------------------
 
 role TransactionCoordinator:
-	action Init:
-    	self.txn_metadata = dict()
+    action Init:
+        self.txn_metadata = dict()
         self.txn_transition = dict()
         self.partition_metadata = dict()
 
@@ -211,7 +211,7 @@ role TransactionCoordinator:
     atomic fair action ReceiveInitPidRequest:
         req = any net_input_buff[self.BROKER_ID] : req.type == Messages.InitPidRequest
 
-    	# Load any TID state that exists
+        # Load any TID state that exists
         result = self.GetTransactionMetadata(req.tid)
         
         # A condition was not met, so immediately return an error.
@@ -280,7 +280,7 @@ role TransactionCoordinator:
 # ----------------------------------------------
 
 action Init:
-	# An auxilliary variable for generating unique pids
+    # An auxilliary variable for generating unique pids
     pid_source = 0
 
     # The network
