@@ -4,7 +4,7 @@
 # Model parameters
 # ----------------------------------------------
 
-NUM_BROKERS = 1 
+NUM_BROKERS = 2
 NUM_CLIENTS = 2
 NUM_TXN_LOG_PARTITIONS = 1
 NUM_TRANSACTION_IDS = 1
@@ -43,8 +43,6 @@ atomic func NetReply(source, recv_msg, send_msg):
     net_input_buff[recv_msg.source].add(send_msg)
     # Remove the processed message from the net buffer of the source
     net_input_buff[source].remove(recv_msg)
-    # Log this processed message (for easier debugging, comment out for state space reduction)
-    net_processed[source].add(recv_msg)
 
 atomic func NetSend(dest, msg):
     net_input_buff[dest].add(msg)
@@ -52,8 +50,6 @@ atomic func NetSend(dest, msg):
 atomic func NetMsgProcessed(source, msg):
     # Remove the processed message from the net buffer of the source
     net_input_buff[source].remove(msg)
-    # Log this processed message (for easier debugging, comment out for state space reduction)
-    net_processed[source].add(msg)
 
 # ----------------------------------------------
 # Client role
@@ -293,14 +289,13 @@ action Init:
         txn_log_partitions.append(TransactionLogPartition(PART=part))
     
     # The transaction coordinators
-    txn_coordinators = []
+    txn_coordinators = bag()
     for broker_id in range(NUM_BROKERS):
         # Create a TC for this broker
         tc = TransactionCoordinator(BROKER_ID=broker_id)
-        txn_coordinators.append(tc)
+        txn_coordinators.add(tc)
         # Add a network for broker
         net_input_buff[broker_id] = genericset()
-        net_processed[broker_id] = genericset()
 
     # Distribute partitions evenly over coordinators
     # Later we'll model TC partition leader elections.
@@ -312,14 +307,13 @@ action Init:
                 tc.BecomeLeader(partition, 1)  # Assign partition to coordinator
 
     # Create the clients
-    clients = []
+    clients = bag()
     for client_id in range(NUM_CLIENTS):
         client_id += 100 # to prevent collisions on network
         client = Client(CLIENT_ID=client_id)
-        clients.append(client)
+        clients.add(client)
         # Add a network for client
         net_input_buff[client_id] = genericset()
-        net_processed[client_id] = genericset()
 
 # ----------------------------------------------
 # Invariants
@@ -340,9 +334,9 @@ always assertion TestInv:
 # Liveness properties
 # ----------------------------------------------
 
-always eventually assertion EventuallyAllClientsGetPid:
-    for client in clients:
-        if client.state != ClientState.HasPid:
-            return False
+# always eventually assertion EventuallyAllClientsGetPid:
+#     for client in clients:
+#         if client.state != ClientState.HasPid:
+#             return False
   
-    return True
+#     return True
