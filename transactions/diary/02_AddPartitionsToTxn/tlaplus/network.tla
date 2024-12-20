@@ -1,6 +1,6 @@
 ------------------------------ MODULE network ------------------------------
 
-EXTENDS FiniteSets, FiniteSetsExt, Sequences, SequencesExt, Integers, TLC
+EXTENDS FiniteSets, FiniteSetsExt, Integers, TLC
 
 VARIABLES messages,
           messages_discard
