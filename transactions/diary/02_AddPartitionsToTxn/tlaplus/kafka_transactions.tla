@@ -10,7 +10,7 @@ EXTENDS Sequences, network
 
 \* Model parameters
 CONSTANTS TxnLogPartitions,
-          TopicPartitions, \* not used yet
+          TopicPartitions,
           Brokers,
           Clients,
           TransactionIds,
@@ -213,7 +213,9 @@ ReceiveInitPidResponse(c, b) ==
            THEN client' = [client EXCEPT ![c].state = HasPid,
                                          ![c].tc = msg.source,
                                          ![c].pid = msg.pid,
-                                         ![c].epoch = msg.pepoch]
+                                         ![c].epoch = msg.pepoch,
+                                         ![c].last_state = None,
+                                         ![c].last_error = None]
            ELSE \* go back to Ready state to try again
                 client' = [client EXCEPT ![c].state = Ready,
                                          ![c].last_state = client[c].state,
@@ -950,10 +952,13 @@ Next ==
             \/ ReceiveAddPartitionsToTxnRequest(b, c)
             \/ ReceiveAddPartitionsToTxnResponse(c, b)
     \/ \E b \in Brokers, p \in TxnLogPartitions:
+        \* Txn log entries get committed, and callbacks executed
         \/ CommitTxnLogAppend(b, p)
+        \* TC elections
         \/ ElectLeader(b, p)
         \/ BecomeFollower(b, p)
     \/ \E b \in Brokers, tid \in TransactionIds :
+        \* Newly elected leaders (TCs) complete partially executed transactions
         CompletePartialTxn(b, tid)
 
 EmptyMap == [x \in {} |-> None]
