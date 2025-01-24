@@ -2,15 +2,19 @@
 EXTENDS FiniteSets, FiniteSetsExt, Sequences, SequencesExt, Integers, TLC,
         network
 
+(*
+    This file contains the constants and variables.
+*)
+
 \*================================================
 \* Constants and variables
 \*================================================
 
 \* The initial cluster size (the size can change over time 
 \* due to reconfigurations)
-CONSTANTS InitClusterSize, 
-          MinClusterSize,   \* reconfigs are limited to cluster sizes >= this value
-          MaxClusterSize    \* reconfigs are limited to cluster sizes <= this value
+CONSTANTS InitClusterSize,  \* The initial size of the cluster
+          MinClusterSize,   \* Reconfigs are limited to cluster sizes >= this value
+          MaxClusterSize    \* Reconfigs are limited to cluster sizes <= this value
 
 \* The set of hosts that KRaft servers are deployed on.
 \* Not super important as server ids have composite ids based on
@@ -22,20 +26,14 @@ CONSTANTS Hosts
 \* The set of values that can go be written to the log
 CONSTANTS Value
 
-\* Server roles. 
-CONSTANTS Voter,   \* A full Raft participant
-          Observer \* Non-voting server that can only maintain
-                   \* a log replica.
-
 \* Server states.
 CONSTANTS Unattached,  \* Voter or observer, but leader unknown.
           Follower,    \* Voter or observer, leader known.
-          Prospective, \* Election timeout has occurred.
+          Prospective, \* Election or fetch timeout has occurred.
           Candidate,   \* Has won a pre-vote, starts an election
           Leader,      \* Won an election
-          Voted,       \* Voted in an election but does not yet know the result
           Resigned,    \* Has abdicated as leader.
-          DeadNoState  \* Has died, losing all state
+          DeadNoState  \* Has died, losing all state (not a real state)
 
 \* Commands
 CONSTANTS AppendCommand,        \* contains a client value
@@ -52,7 +50,7 @@ CONSTANTS Ok, NotOk, Diverging
 
 \* Errors
 CONSTANTS UnknownMember, AlreadyMember, ReconfigInProgress, LeaderNotReady,
-          FencedLeaderEpoch, NotLeader, UnknownLeader
+          FencedLeaderEpoch, NotLeader, UnknownLeader, InvalidRequest
 
 \* Message types:
 CONSTANTS RequestVoteRequest,
@@ -69,8 +67,9 @@ CONSTANTS IllegalState
 
 \* Limiting state space when model checking           
 CONSTANTS MaxEpoch,              \* Limits the number of elections when not testing liveness.
+          MaxDisruptiveElectionTriggers, \* Limits the number of disruptive election triggers.
           MaxValuesPerEpoch,     \* Limits the number of log entries per epoch.
-          MaxCrashes,            \* Limits the number of crashes with loss of state.
+          MaxPermCrashes,        \* Limits the number of crashes with loss of state.
           MaxRestarts,           \* Limits the number of restarts without loss of state
           MaxAddReconfigs,       \* Limits the number of add voter reconfigurations
           MaxRemoveReconfigs,    \* Limits the number of remove voter reconfigurations
@@ -104,7 +103,6 @@ VARIABLE server_ids
 
 VARIABLES config,         \* The current configuration
           current_epoch,  \* The server's epoch number (the Raft term).
-          role,           \* The server's role (Voter or Observer)
           state,          \* The server's state (Follower, Candidate, Observer etc)
           voted_for,      \* The candidate the server voted for in its current epoch.
           leader,         \* The peer that the server believes is the current leader
@@ -128,7 +126,7 @@ VARIABLES aux_ctrs,       \* A set of counters used for state-space control.
 
 \* variable groupings (useful for UNCHANGED)
 logVars == <<log, hwm>>
-serverVars == <<config, current_epoch, role, state, voted_for, leader, 
+serverVars == <<config, current_epoch, state, voted_for, leader, 
                 fetch_state, pending_ack>>
 candidateVars == <<votes_recv>>
 leaderVars == <<flwr_end_offset>>
@@ -149,8 +147,10 @@ AllServers == 1..MaxSpawnedServers
 StartedServers == DOMAIN server_ids \* started includes ever started ie. includes dead
 
 (* 
-    The counters of aux_ctrs:
+    The counters of aux_ctrs (used for limiting state space and liveness checking):
+    - prevote_ctr          : required to avoid cycles that violate liveness
     - election_ctr         : the number of elections that have occurred.
+    - disruptive_ctr       : the number of disruptive election timeouts.
     - value_ctr            : function of the number of values added per epoch.
     - crash_ctr            : the number of server crashes that have occurred.
     - restart_ctr          : the number of server restarts that have occurred.

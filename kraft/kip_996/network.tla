@@ -1,13 +1,9 @@
 --------------------------- MODULE network ---------------------------
 EXTENDS FiniteSets, FiniteSetsExt, Sequences, SequencesExt, Integers, TLC
 
-\* The maximum possible disconnected pairs. If this is set too
-\* high it can break liveness. The maximum value of this constant
-\* should be related to the cluster size:
-\* Cluster of 3: 2
-\* Cluster of 5: 6
-\* When using reconfiguration, set it based on the minimum cluster size.
-CONSTANT MaxDisconnectedPairs
+(*
+    This file includes all message passing and network connectivity logic.
+*)
 
 \* Limits the number of times connectivity between server
 \* pairs can change.
@@ -37,111 +33,110 @@ NetworkInit(servers) ==
     /\ net_connectivity = [pairs \in ServerPairs(servers) |-> TRUE]
     /\ net_connectivity_ctr = 0
 
-----
+\* ======================================================================
+\* Network connectivity -------------------------------------------------
 
 Drop(msgs) ==
+    (*
+        Drops the set of messages.
+    *)
     /\ net_messages' = net_messages \ msgs
     /\ UNCHANGED net_messages_processed
 
-\* Network state transitions
+NewConnectedPairs == 
+    (*
+        Returns all possible subsets of connected server pairs.
+    *)
+    SUBSET DOMAIN net_connectivity
 
-\* Any dead servers are included in network disconnection
-\* to avoid the combination of server death and networking
-\* issues from causing a cluster to be unable to form
-\* a majority of connected servers (which is a fundamental
-\* requisite for KRaft).
+CanChangeConnectivity ==
+    net_connectivity_ctr < MaxConnectivityChanges
 
-PairMatch(servers, pair) ==
-    \E s \in servers : s \in pair
-    
-WholeCohortInPairs(servers, pairs) ==
-    \A s \in servers :
-        \E p \in pairs : s \in p
-        
-IncludesAllDead(dead_servers, disconnected_pairs) ==
-    /\ WholeCohortInPairs(dead_servers, disconnected_pairs)
-    /\ ~\E pair \in DOMAIN net_connectivity :
-        /\ PairMatch(dead_servers, pair)
-        /\ pair \notin disconnected_pairs    
-
-DisconnectedCount(net_conn) ==
-    Quantify(DOMAIN net_conn, 
-             LAMBDA pair : net_conn[pair] = FALSE)
-
-ChangeConnectivity(dead_servers) ==
-    /\ net_connectivity_ctr < MaxConnectivityChanges
-    /\ \E disconnected_pairs \in SUBSET DOMAIN net_connectivity :
-        \* the new disconnected set must include dead servers
-        /\ IncludesAllDead(dead_servers, disconnected_pairs)
-        \* if we're already over the disconnected limit, then reduce
-        \* the number of disconnected pairs, else simply stay at or below the limit
-        /\ IF DisconnectedCount(net_connectivity) > MaxDisconnectedPairs
-           THEN Cardinality(disconnected_pairs) < DisconnectedCount(net_connectivity)
-           ELSE Cardinality(disconnected_pairs) <= MaxDisconnectedPairs
-        \* make sure the new disconnected set is different to the current
-        /\ IF Cardinality(disconnected_pairs) = DisconnectedCount(net_connectivity)
-           THEN \E pair \in disconnected_pairs :
-                    net_connectivity[pair] = TRUE
-           ELSE TRUE
-        /\ net_connectivity' = [pair \in DOMAIN net_connectivity |->
-                                    IF pair \in disconnected_pairs
-                                    THEN FALSE
-                                    ELSE TRUE]
-        /\ Drop({m \in net_messages : 
-                    \E pair \in disconnected_pairs :
-                        /\ m.source \in pair
-                        /\ m.dest \in pair})
+ChangeConnectivity(connected) ==
+    (*
+        Updates the connected server to match the provided set of
+        connected servers. Also drops any inflight messages between
+        servers that have just lost connectivity.
+    *)
+    /\ net_connectivity' = [pair \in DOMAIN net_connectivity |->
+                                IF pair \in connected
+                                THEN TRUE
+                                ELSE FALSE]
+    /\ Drop({m \in net_messages : 
+                ~\E pair \in connected :
+                    /\ m.source \in pair
+                    /\ m.dest \in pair})
     /\ net_connectivity_ctr' = net_connectivity_ctr + 1
 
-\* ======================================================================
-\* ----- Message passing ------------------------------------------------
-
 Connected(s1, s2) ==
-    \/ s1 = s2
-    \/ \E pair \in DOMAIN net_connectivity :
+    (*
+        TRUE if the two servers have visibility of each other.
+    *)
+    /\ s1 # s2
+    /\ \E pair \in DOMAIN net_connectivity :
         /\ s1 \in pair
         /\ s2 \in pair
         /\ net_connectivity[pair] = TRUE
     
-ConnectedServers(target, servers) ==
-    1 + Quantify(servers, LAMBDA s : 
-                        /\ s # target
-                        /\ \E pair \in DOMAIN net_connectivity :
-                            /\ target \in pair
-                            /\ s \in pair
-                            /\ net_connectivity[pair] = TRUE)
+NumConnections(target, servers) ==
+    (*
+        The number of connections the target server has. So in a 
+        cluster of 3, if s1 is connected to s2 and s3 the result is 2.
+    *)
+    Quantify(servers, LAMBDA s : 
+                    /\ s # target
+                    /\ \E pair \in DOMAIN net_connectivity :
+                        /\ target \in pair
+                        /\ s \in pair
+                        /\ net_connectivity[pair] = TRUE)
 
-ConnectedMajority(target, servers) ==
-    ConnectedServers(target, servers) > Cardinality(servers) \div 2
+ConnectedPairsWithoutServer(s) ==
+    (*
+        The number of connected server pairs, if server s were removed.
+    *)
+    { pair \in DOMAIN net_connectivity : 
+        /\ s \notin pair
+        /\ net_connectivity[pair] = TRUE }
 
-DisconnectDeadServer(dead_server) ==
+DisconnectServer(server) ==
+    (*
+        Disconnect the provided server. Drop all its incoming
+        and outgoing inflight messages.
+    *)
     LET new_conn == [pair \in DOMAIN net_connectivity |->
-                                IF dead_server \in pair
+                                IF server \in pair
                                 THEN FALSE
                                 ELSE net_connectivity[pair]]
-    IN /\ DisconnectedCount(new_conn) <= MaxDisconnectedPairs
-       /\ net_connectivity' = new_conn 
+    IN /\ net_connectivity' = new_conn 
        /\ Drop({m \in net_messages : 
-                    \/ m.source = dead_server
-                    \/ m.dest = dead_server})
+                    \/ m.source = server
+                    \/ m.dest = server})
        /\ UNCHANGED << net_connectivity_ctr >>
 
+\* ======================================================================
+\* ----- Message passing ------------------------------------------------
 
-\* Send the message whether it already exists or not.
-\* If it does exist, the delivery count will go above 1 and
-\* the message can be delivered multiple times.
 SendFunc(m, msgs, deliver_count) ==
+    (*
+        Send the message whether it already exists or not.
+        If it does exist, the delivery count will go above 1 and
+        the message can be delivered multiple times.
+    *)
     IF deliver_count > 0
     THEN msgs \union {m}
     ELSE msgs
 
-\* Remove a message from the bag of messages. Used when a server is done
-\* processing a message.
 DiscardFunc(m, msgs) ==
+    (*
+        Remove a message from the bag of messages. Used when a 
+        server is done processing a message.
+    *)
     msgs \ {m}
 
-\* Send a message, without restriction
 Send(m) ==
+    (*
+        Send a message, but if the connection is down, lose the message.
+    *)
     /\ net_messages' = IF Connected(m.dest, m.source)
                        THEN SendFunc(m, net_messages, 1)
                        ELSE SendFunc(m, net_messages, 0)
@@ -149,6 +144,10 @@ Send(m) ==
 
 RECURSIVE SendAllFunc(_,_)
 SendAllFunc(send_msgs, msgs) ==
+    (*
+        Send a set of messages. Lose any messages on connections
+        that are down.
+    *)
     IF send_msgs = {}
     THEN msgs
     ELSE LET m == CHOOSE m \in send_msgs : TRUE
@@ -163,61 +162,85 @@ SendAll(msgs) ==
     /\ UNCHANGED << net_messages_processed, net_connectivity, 
                     net_connectivity_ctr >>
 
-\* Guarantees the message is sent once. Used to disable an action without
-\* an explicit variable.
 SendAllOnce(msgs) ==
-    /\ ~\E m \in msgs :
-        \/ m \in net_messages
-        \/ m \in net_messages_processed
+    (*
+        Sends all the messages.
+    *)
+\*    /\ ~\E m \in msgs :
+\*        \/ m \in net_messages
+\*        \/ m \in net_messages_processed
     /\ net_messages' = SendAllFunc(msgs, net_messages)
     /\ UNCHANGED << net_messages_processed, net_connectivity, net_connectivity_ctr >>    
 
 DiscardAndSendAll(d, msgs) ==
+    (*
+        Discards message (d) and sends all the messages of set (msgs).
+    *)
     /\ net_messages' = SendAllFunc(msgs, DiscardFunc(d, net_messages))
     /\ net_messages_processed' = net_messages_processed \union {d}
     /\ UNCHANGED << net_connectivity, net_connectivity_ctr >>
 
-\* Set the delivery count to 0 so the message cannot be processed again.
 Discard(d) ==
+    (*
+        Discards the message and adds it to the processed set.
+    *)
     /\ net_messages' = DiscardFunc(d, net_messages)
     /\ net_messages_processed' = net_messages_processed \union {d}
     /\ UNCHANGED << net_connectivity, net_connectivity_ctr >>
     
-\* Discard incoming message and reply with another    
 Reply(d, m) ==
+    (*
+        Discards one message and sends another.
+    *)
     /\ Connected(m.dest, m.source)
     /\ d \in net_messages
     /\ net_messages' = SendFunc(m, DiscardFunc(d, net_messages), 1)
     /\ net_messages_processed' = net_messages_processed \union {d}
     /\ UNCHANGED << net_connectivity, net_connectivity_ctr >>
 
-PreviouslySent(m) ==
-    \/ m \in net_messages
-    \/ m \in net_messages_processed    
-
 HasInflightVoteReq(s, type, pre_vote) ==
+    (*
+        TRUE if the server has any outbound requests inflight.
+        Used to figure out if a timeout should occur.
+    *)
     \E m \in net_messages :
         /\ m.type = type
         /\ m.pre_vote = pre_vote
         /\ m.source = s
 
 HasInflightVoteRes(s, type, pre_vote) ==
+    (*
+        TRUE if the server has any inbound responses inflight.
+        Used to figure out if a timeout should occur.
+    *)
     \E m \in net_messages :
         /\ m.type = type
         /\ m.pre_vote = pre_vote
         /\ m.dest = s
 
-InflightOrProcessed(source, dest, type) ==
+NotLostReqWithReplicaEpoch(source, dest, type, epoch) ==
+    (*
+        Figures out if a server never received a BeginQuorumEpochRequest
+        it needs. TRUE if the request has been processed or is 
+        still inflight.
+    *)
     \/ \E m \in net_messages :
         /\ m.type = type
+        /\ m.replica_epoch = epoch
         /\ m.source = source
         /\ m.dest = dest
     \/ \E m \in net_messages_processed :
         /\ m.type = type
         /\ m.source = source
+        /\ m.replica_epoch = epoch
         /\ m.dest = dest
 
-RequestOrResLost(req, type) ==
+FetchRequestOrResLost(req, type) ==
+    (*
+        Figures out if a fetch request or its corresponding
+        response has been lost. This is needed to detect
+        a fetch timeout.
+    *)
     /\ req \notin net_messages
     /\ ~\E res \in net_messages :
         /\ res.type = type

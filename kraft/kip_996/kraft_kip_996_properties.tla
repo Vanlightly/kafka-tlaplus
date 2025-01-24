@@ -4,6 +4,10 @@ EXTENDS FiniteSets, FiniteSetsExt, Sequences, SequencesExt, Integers, TLC,
         kraft_kip_996_functions,
         network
 
+(*
+    This file contains all the safety and liveness properties.
+*)
+
 \*================================================
 \* Invariants (safety properties)
 \*================================================
@@ -17,14 +21,14 @@ ValueInServerLogAndCommitted(s, v) ==
         /\ log[s][offset].value = v
         /\ hwm[s] >= offset
 
-\* INV: NoIllegalState
+\* INV: NoIllegalState ---------------------------------------------
 \* If a server enters an illegal state then something went wrong.
 \* An IllegalState should not be possible.
 NoIllegalState ==
     ~\E i \in StartedServers :
         state[i] = IllegalState
 
-\* INV: NoLogDivergence
+\* INV: LogMatching ------------------------------------------------
 \* Each log offset is consistent across all servers (on those
 \* servers whose high watermark is equal or higher than the offset).
 MinHighWatermark(s1, s2) ==
@@ -32,7 +36,7 @@ MinHighWatermark(s1, s2) ==
     THEN hwm[s1]
     ELSE hwm[s2]
 
-NoLogDivergence ==
+LogMatching ==
     \A s1, s2 \in StartedServers :
         IF s1 = s2
         THEN TRUE
@@ -42,18 +46,11 @@ NoLogDivergence ==
                THEN \A offset \in 1..lowest_common_hwm : log[s1][offset] = log[s2][offset]
                ELSE TRUE
 
-\* INV: StatesMatchRoles
-\* Ensures that the combination of state and role remains consistent.
-StatesMatchRoles ==    
-    \A s \in StartedServers :
-        /\ role[s] = Observer => state[s] \in ObserverStates
-        /\ state[s] = Unattached => leader[s] = Nil
-
-\* INV: NeverTwoLeadersInSameEpoch
+\* INV: ElectionSafety ----------------------------------------
 \* We cannot have two servers having a conflicting
 \* view on who the leader is in the same epoch.
 
-NeverTwoLeadersInSameEpoch ==    
+ElectionSafety ==    
     ~\E s1, s2 \in StartedServers :
         /\ s1 # s2
         /\ leader[s1] # Nil
@@ -61,8 +58,8 @@ NeverTwoLeadersInSameEpoch ==
         /\ leader[s1] # leader[s2]
         /\ current_epoch[s1] = current_epoch[s2]
 
-\* INV: LeaderHasAllAckedValues
-\* A non-stale leader cannot be missing an acknowledged value
+\* INV: LeaderCompleteness -----------------------------------------------
+\* A non-stale leader cannot be missing a committed value
 
 IsCurrentLeader(s) ==
     /\ state[s] = Leader
@@ -71,8 +68,8 @@ IsCurrentLeader(s) ==
         /\ s1 # s
         /\ current_epoch[s1] > current_epoch[s]
 
-LeaderHasAllAckedValues ==
-    \* for every acknowledged value
+LeaderCompleteness ==
+    \* for every acknowledged value (committed in a prior or current epoch)
     \A v \in inv_pos_acked :
         \* there does not exist a server that
         ~\E s \in StartedServers :
@@ -81,20 +78,23 @@ LeaderHasAllAckedValues ==
             \* and that is missing the value
             /\ ~ValueInServerLog(s, v)
 
-\* INV: AckedValueNotLost
+\* INV: Durability -------------------------------------------------
 \* An acknowledged value must exist on at least one 
 \* live functioning voter server.
-
-AckedValueNotLost ==
+Durability ==
     \A v \in inv_pos_acked :
         \E s \in StartedServers :
-            /\ role[s] = Voter
+            /\ IsVoter(s)
             /\ ValueInServerLog(s, v)
-
-ValidVotesRecv ==
+            
+\* INV: ValidRolesAndStates -----------------------------------------
+\* Ensures that the combination of state and role remains consistent.
+ValidRolesAndStates ==    
     \A s \in StartedServers :
-        Cardinality(votes_recv[s]) > 0 => 
-            state[s] \in {Prospective, Candidate}
+        /\ IsObserver(s) => state[s] \in ObserverStates
+        /\ state[s] = Unattached => leader[s] = Nil
+        /\ state[s] # Leader => pending_ack[s] = {}
+        /\ Cardinality(votes_recv[s]) > 0 => state[s] \in {Prospective, Candidate}
 
 \* INV: Used in debugging
 TestInv ==
@@ -115,7 +115,7 @@ ValuesEventuallyAcked ==
                              \/ /\ v \in inv_pos_acked
                                 /\ v \notin inv_neg_acked)
 
-\* LIVENESS: ReconfigurationCompletes -----------
+\* LIVENESS: ReconfigurationNotStuck -----------
 \* A reconfiguration command will either get committed and be
 \* fully replicated or it will be truncated and not be found on
 \* any (connected/alive) server log. Detects a reconfiguration
@@ -157,7 +157,7 @@ ReconfigurationNotStuck ==
 FunctionalLeaderExists ==
     \E s \in StartedServers : 
         /\ state[s] = Leader
-        /\ Quantify(StartedServers, LAMBDA s1 : /\ role[s1] = Voter
+        /\ Quantify(StartedServers, LAMBDA s1 : /\ IsVoter(s1)
                                                 /\ leader[s1] = s
                                                 /\ s \in config[s1].members) 
               >= MajorityCount(config[s].members)

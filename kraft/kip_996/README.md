@@ -1,44 +1,72 @@
 # KIP 996 - KRaft pre-vote
 
-This specification is based on (but does not directly use) the spec of KIP-853.
-
 Find the KIP here: https://cwiki.apache.org/confluence/display/KAFKA/KIP-996%3A+Pre-Vote
-The spec may differ from the KIP as during the early work phase, this spec has uncovered issues with the KIP and the KIP may not yet be updated to reflect the current understanding.
 
-## Basic mechanics
+## Basic mechanics of pre-vote
 
-When a fetch or election timeout occurs, a server transitions to the Prospective state but does not increment the epoch. The Prospective sends out a pre-vote RequestVote request to its peers in the current configuration. It also votes for itself.
+TODO: Do a prose write-up as I did for the Kafka Replication Protocol.
 
-On receiving a pre-vote request, a server will grant a pre-vote if:
-a) It is not a follower.
-b) Or, it is a follower but has not made a successful fetch since becoming a follower.
-
-When a follower grants a pre-vote, it sets the leaderId field in the response to Nil. This enables the MaybeHandleCommonResponse to remain unchanged.
-
-When a prospective receives a positive pre-vote response, with a matching epoch, it adds the vote to its received votes. When it has received a majority vote, it increments its epoch and transitions to Candidate, and follows the regular election process from that point.
-
-When a prospective receives a negative pre-vote, that includes a non-Nil leaderId that is not itself, it immediately transtions to a follower of that leader. If the leaderId is Nil, or indicates itself, it remains in Prospective. If it does not receive enough votes, it will start another pre=vote after an election timeout.
-
-A prospective that has fallen behind its peers will be unable to win a pre-vote. In the case that the leader is fine and the other followers are still connected to it, the Prospective will need to give up on a pre-vote and become a regular follower. Constantly starting new pre-votes which will be rejected would leave it stuck as a Prospective. This is why the prospective will transition to follower if a peer rejects its pre-vote and knows who the leader is.
-
-In the case that the leader is unreachable by its followers, a pre-vote will only be successful once a majority of the servers have transitioned to Prospective, or have transitioned back to Follower from Prospective but been unable to fetch. This majority will lead to an eventual successful pre-vote and an election.
-
-The reason why a Follower which has not yet made a successful fetch can grant a pre-vote, is that otherwise, two servers could keep rejecting each others pre-votes and switching between follower and Prospective in a comedic cycle (violating liveness). Despite the leader (r1) being down, when Follower (r2) tells Prospective (r3) it knows that the leader is (r1) in a pre-vote response, the Prospective r2 transitions to Follower and resets its fetch timeout timer. Then when r2 has a fetch timeout and becomes a Prospective, r3 rejects the pre-vote saying the leader is r1. This cycle is avoided by tracking whether the follower has ever made a successful fetch since becoming a follower, if it hasn't then despite it being a follower, it will grant the pre-vote.
+See the KIP for how it works.
 
 ## Safety and liveness
 
-This specification uses different behavior when checking safety only, and when checking both safety and liveness. When checking safety, actions such as fetch timeouts, election timeouts and check quorum resignations can occur at any time. However, when checking liveness, constant elections or resignations can actually cause liveness checks to fail as the cluster never reaches stability where replication can occur. Likewise, sometimes a resignation or election is actually required for the cluster to make progress. Therefore, when checking liveness, events such as elections and resignations only occur when there is reason for the occurrence, such as loss of connectivity or inability to receive a successful fetch response.
+### Safety
 
-This liveness behavior strategy adds some complexity to the specification but has also been able to detect numerous liveness issues during the KIP design phase. Therefore, while the additional complexity is undesirable, it has become valuable enough to be worth it.
+The following invariants are specified, as per the Raft paper:
+- **LogMatching**: If two logs contain a record with the same offset and epoch, then the logs are identical in all records up through the given offset.
+- **ElectionSafety**: At most one server can be elected leader in one epoch.
+- **LeaderCompleteness**: A leader will host all committed records.
+
+Additionally, we have the invariants:
+- **Durability**: All committed records will exist on at least one voter.
+- **ValidRolesAndStates**: Checks for inconsistencies in per server state.
+
+### Liveness
+
+In order to test liveness under different network partition topologies, this spec models network connectivity between servers and includes an action for changing the connectivity.
+
+#### Properties
+
+The following liveness properties are implemented:
+- **ValuesEventuallyAcked**: Every value that can be written, will eventually be written and either a positive or a negative acknowledgement sent. This detects stuck values.
+- **ReconfigurationNotStuck**: A reconfiguration command (AddVoter/RemoveVoter) eventually gets committed or is removed from all logs (due to a leader change).
+- **EventuallyLeaderElected**: If the cluster has no functional leader, then eventually a functional leader will get elected.
+- **NotStuckInProspective**: If a server transitions to Prospective, it will eventually transition to a different state.
+
+#### Making the spec work with liveness properties
+
+Liveness is typically hard to support. Making it work in this spec has caused some additional complexity. The strategy to support liveness in this spec is to **limit the number of perturbation actions but not actions that lead to recovery**. For example, a counter is used to count the number of times a pre-vote is initiated without an explicit trigger, such as a network partition or a leader crashing or resigning. Such pre-votes are disruptive to a stable cluster. However, once a pre-vote has initiated, it is allowed to run its course without limitation. The implication of this is that the state space is infinite as every election can end up a draw, requiring a new election. Therefore, when testing liveness, **you can only use simulation mode** because the state space is infinite. There is no good way around this limitation.
+
+When testing liveness, set the constant `TestLiveness = TRUE`. This changes the specifications behavior to proactively prevents cycles that would cause liveness properties to fail. It does this by:
+- Adding an pre-vote counter to ensure the state space changes on each pre-vote initiation. Because the epoch does not get bumped, TLC will see cycles without this counter.
+- Add additional conditions to actions such as sending fetch requests, to avoid cycles.
+- Prevent AddVoter and RemoveVoter commands from causing a cluster to get stuck when a cluster is already in a severely degraded state.
+- Only allowing network connectivity changes that maintains a functioning majority of connected servers.
+- Only allowing a server to crash if a functioning majority is remaining afterward.
+
+Many of these extra conditions are placed in the kraft_kip_996_liveness.tla module to not pollute the main spec. When `TestLiveness = FALSE`, none of the above behavior changes are employed.
+
+## Running TLC
+
+This specification includes both pre-vote and reconfiguration which means that is large, with a large number possible actions that can happen at any moment. Due to this, the state space is huge and I recommend only using simulation mode.
+
+There are two cfg files:
+- `kraft_kip_996.cfg` configured for testing safety properties only.
+- `model_liveness.cfg` configured for safety and liveness.
+
+Note that when testing liveness, the state space is infinite (as elections may be needed for progress, causing infinite elections). When using simulation by default it will stop a trace at 100 steps. You can increase that using the `-depth` argument.
+
+Note that simulation mode is single-threaded when testing liveness. To use all cores, run multiple instances of TLC with each writing its output to a file.
 
 ## Reading the specification
 
 The specification is split into the following files:
 
-- network.tla: message passing and connectivity.
-- kraft_kip_996_types.tla: the constants and variables.
-- kraft_kip_996_functions.tla: common functions and helper functions.
-- kraft_kip_996_properties.tla: invariants and liveness properties.
-- kraft_kip_996.tla: actions, init and next.
+- `kraft_kip_996.tla`: The main spec with the actions, init and next.
+- `network.tla`: Message passing and connectivity.
+- `kraft_kip_996_types.tla`: The constants and variables.
+- `kraft_kip_996_functions.tla`: Common functions and helper functions.
+- `kraft_kip_996_properties.tla`: Invariants and liveness properties.
+- `kraft_kip_996_liveness.tla`: Extra conditions to avoid cycles when testing liveness.
 
 You may which to start at the Next state formula section which will show you each possible action that can occur.
